@@ -1,6 +1,6 @@
 import type { EventBridgeHandler } from 'aws-lambda'
 import webpush from 'web-push'
-import { putItem, scanItems, TABLES } from '../../lib/dynamo'
+import { putItem, scanItems, updateItem, TABLES } from '../../lib/dynamo'
 import { getCandlesBatch } from '../../lib/deriv'
 import {
   calculateStochastic,
@@ -110,11 +110,14 @@ async function processIndex(
   const ts = signal.timestamp
   await putItem(TABLES.SIGNALS, { PK: 'SIGNAL', SK: `${ts}#${index}`, ...signal })
 
-  await notifyProUsers(signal)
+  const notifiedUserIds = await notifyProUsers(signal)
+  if (notifiedUserIds.length > 0) {
+    await updateItem(TABLES.SIGNALS, { PK: 'SIGNAL', SK: `${ts}#${index}` }, { notificadoA: notifiedUserIds })
+  }
 }
 
-async function notifyProUsers(signal: Signal): Promise<void> {
-  const allUsers = await scanItems<User & { PK: string }>(({ TableName: TABLES.USERS } as Parameters<typeof scanItems>[0]))
+async function notifyProUsers(signal: Signal): Promise<string[]> {
+  const allUsers = await scanItems<User & { PK: string }>({ TableName: TABLES.USERS })
 
   const proUsers = allUsers.filter(
     (u) => u.plan === 'pro' && (u.status === 'active' || u.status === 'trial'),
@@ -123,6 +126,7 @@ async function notifyProUsers(signal: Signal): Promise<void> {
   const emoji = signal.tipo === 'CRASH' ? '🔴' : '🟢'
   const accion = signal.tipo === 'CRASH' ? 'SELL' : 'BUY'
   const indexLabel = signal.indice.replace('_', ' ')
+  const notifiedUserIds: string[] = []
 
   for (const user of proUsers) {
     const watches = user.watchlist ?? []
@@ -140,8 +144,17 @@ async function notifyProUsers(signal: Signal): Promise<void> {
           data: { url: '/signals' },
         }),
       )
-    } catch (err) {
-      console.error('Push error for user', user.PK, err)
+      notifiedUserIds.push(user.PK)
+    } catch (err: unknown) {
+      const statusCode = (err as { statusCode?: number })?.statusCode
+      if (statusCode === 410 || statusCode === 404) {
+        // Subscription expired or no longer valid — remove it to avoid repeated failures
+        await updateItem(TABLES.USERS, { PK: user.PK, SK: 'PROFILE' }, { pushSubscription: null })
+      } else {
+        console.error('Push error for user', user.PK, err)
+      }
     }
   }
+
+  return notifiedUserIds
 }

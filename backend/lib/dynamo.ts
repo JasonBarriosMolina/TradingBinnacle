@@ -79,6 +79,12 @@ export async function queryItems<T>(params: QueryCommandInput): Promise<T[]> {
 }
 
 export async function scanItems<T>(params: ScanCommandInput): Promise<T[]> {
-  const res = await db.send(new ScanCommand(params))
-  return (res.Items ?? []) as T[]
+  const items: T[] = []
+  let lastKey: Record<string, unknown> | undefined
+  do {
+    const res = await db.send(new ScanCommand({ ...params, ExclusiveStartKey: lastKey }))
+    items.push(...((res.Items ?? []) as T[]))
+    lastKey = res.LastEvaluatedKey as Record<string, unknown> | undefined
+  } while (lastKey)
+  return items
 }
