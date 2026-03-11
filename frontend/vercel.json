@@ -1,0 +1,6 @@
+{
+  "alias": ["syntra-cr.vercel.app", "syntra-sable.vercel.app"],
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

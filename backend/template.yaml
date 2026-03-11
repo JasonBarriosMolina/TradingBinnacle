@@ -1,0 +1,576 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: SYNTRA - Trading Journal & Signal System
+
+Globals:
+  Function:
+    Runtime: nodejs20.x
+    Timeout: 30
+    MemorySize: 512
+    Environment:
+      Variables:
+        DYNAMODB_TABLE_USERS: !Ref UsersTable
+        DYNAMODB_TABLE_TRADES: !Ref TradesTable
+        DYNAMODB_TABLE_SIGNALS: !Ref SignalsTable
+        S3_BUCKET_CHARTS: !Ref ChartsBucket
+        COGNITO_USER_POOL_ID: !Ref UserPool
+        COGNITO_CLIENT_ID: !Ref UserPoolClient
+        # Loaded from SSM at deploy time:
+        CLOUDFRONT_URL: '{{resolve:ssm:syntra.cloudfront-url}}'
+        DERIV_APP_ID: '{{resolve:ssm:syntra.deriv-app-id}}'
+        DERIV_SYSTEM_TOKEN: '{{resolve:ssm:syntra.deriv-system-token}}'
+        VAPID_PUBLIC_KEY: '{{resolve:ssm:syntra.vapid-public-key}}'
+        VAPID_PRIVATE_KEY: '{{resolve:ssm:syntra.vapid-private-key}}'
+        VAPID_EMAIL: '{{resolve:ssm:syntra.vapid-email}}'
+        SES_FROM_EMAIL: '{{resolve:ssm:syntra.ses-from-email}}'
+        BANK_INFO_SINPE: '{{resolve:ssm:syntra.bank-sinpe}}'
+        BANK_INFO_CUENTA: '{{resolve:ssm:syntra.bank-cuenta}}'
+        MONTHLY_PRICE_USD: '{{resolve:ssm:syntra.monthly-price}}'
+        TRIAL_DAYS: '{{resolve:ssm:syntra.trial-days}}'
+        ADMIN_USER_IDS: '{{resolve:ssm:syntra.admin-user-ids}}'
+        TOKEN_SECRET: '{{resolve:ssm:syntra.token-secret}}'
+        METAAPI_TOKEN: '{{resolve:ssm:syntra.metaapi-token}}'
+
+Resources:
+  # ─── API Gateway ──────────────────────────────────────────────────────────────
+  SyntraApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins:
+          - "https://syntra-cr.vercel.app"
+          - "https://syntra-sable.vercel.app"
+          - "https://frontend-nine-kappa-s0iqperjyd.vercel.app"
+          - "http://localhost:5173"
+          - "http://localhost:4173"
+        AllowHeaders:
+          - Content-Type
+          - Authorization
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowCredentials: false
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: CognitoAuthorizer
+        Authorizers:
+          CognitoAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience:
+                - !Ref UserPoolClient
+
+  # ─── Auth Functions ───────────────────────────────────────────────────────────
+  RegisterFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/auth/handler.register
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - SESCrudPolicy: { IdentityName: '*' }
+        - Statement:
+            Effect: Allow
+            Action: cognito-idp:AdminCreateUser
+            Resource: !GetAtt UserPool.Arn
+        - Statement:
+            Effect: Allow
+            Action: cognito-idp:AdminSetUserPassword
+            Resource: !GetAtt UserPool.Arn
+        - Statement:
+            Effect: Allow
+            Action: cognito-idp:AdminGetUser
+            Resource: !GetAtt UserPool.Arn
+      Events:
+        Register:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/register
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  LoginFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/auth/handler.login
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - Statement:
+            Effect: Allow
+            Action: cognito-idp:AdminInitiateAuth
+            Resource: !GetAtt UserPool.Arn
+      Events:
+        Login:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/login
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  RefreshTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/auth/handler.refreshToken
+      Policies:
+        - Statement:
+            Effect: Allow
+            Action: cognito-idp:AdminInitiateAuth
+            Resource: !GetAtt UserPool.Arn
+      Events:
+        RefreshToken:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/refresh-token
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  ForgotPwFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/auth/handler.forgotPw
+      Policies: []
+      Events:
+        ForgotPw:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/forgot-password
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  ConfirmResetFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/auth/handler.confirmReset
+      Events:
+        ConfirmReset:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/confirm-reset-password
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  GetMeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/auth/handler.getMe
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        GetMe:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/me
+            Method: GET
+
+  SaveDerivTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/auth/handler.derivTokenHandler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        Save:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/deriv-token
+            Method: POST
+        Delete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/deriv-token
+            Method: DELETE
+
+  Mt5CredentialsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/auth/handler.mt5CredentialsHandler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        Save:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/mt5-credentials
+            Method: POST
+        Delete:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /auth/mt5-credentials
+            Method: DELETE
+
+  # ─── Trades Functions ─────────────────────────────────────────────────────────
+  HistorySyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/sync.historySync
+      Timeout: 60
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+      Events:
+        HistorySync:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /trades/sync-history
+            Method: POST
+
+  SyncTradesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/sync.handler
+      Timeout: 60
+      MemorySize: 1024
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+        - S3CrudPolicy: { BucketName: !Ref ChartsBucket }
+      Events:
+        Sync:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /trades/sync
+            Method: POST
+
+  GetTradesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/get.list
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /trades
+            Method: GET
+
+  GetOneTradeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/get.getOne
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+      Events:
+        GetOne:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /trades/{tradeId}
+            Method: GET
+
+  GetTradeCandlesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/get.getTradeCandles
+      Timeout: 20
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+      Events:
+        GetTradeCandles:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /trades/{tradeId}/candles
+            Method: GET
+
+  StatsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/get.stats
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+      Events:
+        Stats:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /stats
+            Method: GET
+
+  Mt5SyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/mt5sync.handler
+      Timeout: 120
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+        - S3CrudPolicy: { BucketName: !Ref ChartsBucket }
+        - Statement:
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-Mt5SyncFunction-*'
+      Events:
+        Sync:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /trades/mt5-sync-now
+            Method: POST
+
+  Mt5HistorySyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/mt5sync.historySync
+      Timeout: 180
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+        - S3CrudPolicy: { BucketName: !Ref ChartsBucket }
+        - Statement:
+            Effect: Allow
+            Action: lambda:InvokeFunction
+            Resource: !Sub 'arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${AWS::StackName}-Mt5HistorySyncFunction-*'
+      Events:
+        HistorySync:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /trades/mt5-sync-history
+            Method: POST
+
+  Mt5DailySyncFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/trades/mt5sync.dailySync
+      Timeout: 900
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref TradesTable }
+      Events:
+        DailySchedule:
+          Type: Schedule
+          Properties:
+            Schedule: cron(0 6 * * ? *)
+            Enabled: true
+
+  # ─── Signals Functions ────────────────────────────────────────────────────────
+  SignalMonitorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/signals/monitor.handler
+      Timeout: 55
+      MemorySize: 512
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref SignalsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      EventInvokeConfig:
+        MaximumRetryAttempts: 0   # Prevent cascading concurrent invocations on timeout
+      Events:
+        Schedule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Enabled: true
+
+  GetSignalsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/signals/get.list
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref SignalsTable }
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /signals
+            Method: GET
+
+  UpdateWatchlistFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/signals/get.updateWatchlist
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        Update:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /signals/watchlist
+            Method: PUT
+
+  SavePushSubFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/signals/get.savePushSub
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        Save:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /signals/push-subscription
+            Method: POST
+
+  # ─── Admin Functions ──────────────────────────────────────────────────────────
+  AdminListUsersFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/admin/users.list
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        List:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /admin/users
+            Method: GET
+
+  AdminUpdateUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/admin/users.update
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        Update:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /admin/users/{userId}
+            Method: PUT
+
+  # ─── DynamoDB Tables ──────────────────────────────────────────────────────────
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: syntra-users
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  TradesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: syntra-trades
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+
+  SignalsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: syntra-signals
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      TimeToLiveSpecification:
+        AttributeName: ttl
+        Enabled: true
+
+  # ─── S3 Bucket ────────────────────────────────────────────────────────────────
+  ChartsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'syntra-charts-${AWS::AccountId}'
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  # ─── Cognito ──────────────────────────────────────────────────────────────────
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: syntra-users
+      AutoVerifiedAttributes:
+        - email
+      UsernameAttributes:
+        - email
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireUppercase: false
+          RequireSymbols: false
+      Schema:
+        - Name: name
+          AttributeDataType: String
+          Mutable: true
+          Required: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: syntra-web
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows:
+        - ALLOW_ADMIN_USER_PASSWORD_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+      AccessTokenValidity: 8
+      IdTokenValidity: 8
+      RefreshTokenValidity: 30
+
+Outputs:
+  ApiUrl:
+    Value: !Sub 'https://${SyntraApi}.execute-api.${AWS::Region}.amazonaws.com'
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  ChartsBucketName:
+    Value: !Ref ChartsBucket

@@ -1,0 +1,13 @@
+{
+  "name": "syntra",
+  "version": "1.0.0",
+  "description": "Trading journal & signal system for Deriv synthetic indices",
+  "private": true,
+  "scripts": {
+    "dev": "cd frontend && npm run dev",
+    "build:frontend": "cd frontend && npm run build",
+    "build:backend": "cd backend && npm run build",
+    "build": "npm run build:frontend && npm run build:backend",
+    "typecheck": "cd frontend && npx tsc --noEmit && cd ../backend && npx tsc --noEmit"
+  }
+}
