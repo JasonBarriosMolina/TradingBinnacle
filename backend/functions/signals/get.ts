@@ -1,13 +1,18 @@
 import type { APIGatewayProxyEventV2WithJWTAuthorizer } from 'aws-lambda'
-import { queryItems, updateItem, TABLES } from '../../lib/dynamo'
+import { getItem, queryItems, updateItem, TABLES } from '../../lib/dynamo'
 import { ok, err, getUserId } from '../../lib/lambda'
-import type { Signal, IndexSymbol } from '../../../shared/types'
+import type { Signal, IndexSymbol, User } from '../../../shared/types'
 
 // GET /signals — last 24h signals for Pro users
 export const list = async (event: APIGatewayProxyEventV2WithJWTAuthorizer) => {
   try {
     const userId = getUserId(event)
     if (!userId) return err('No autorizado', 401)
+
+    const user = await getItem<User>(TABLES.USERS, { PK: userId, SK: 'PROFILE' })
+    if (!user || user.plan !== 'pro' || !['active', 'trial'].includes(user.status)) {
+      return err('Acceso restringido a plan Pro', 403)
+    }
 
     const since = new Date(Date.now() - 24 * 3600 * 1000).toISOString()
 
