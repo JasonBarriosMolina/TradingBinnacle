@@ -1,6 +1,7 @@
 import type { EventBridgeHandler } from 'aws-lambda'
 import webpush from 'web-push'
 import { putItem, scanItems, updateItem, TABLES } from '../../lib/dynamo'
+import { sendTelegramMessage } from '../../lib/telegram'
 import { getCandlesBatch } from '../../lib/deriv'
 import {
   calculateStochastic,
@@ -128,30 +129,46 @@ async function notifyProUsers(signal: Signal): Promise<string[]> {
   const indexLabel = signal.indice.replace('_', ' ')
   const notifiedUserIds: string[] = []
 
+  const telegramText =
+    `${emoji} <b>Señal ${signal.tipo} — ${indexLabel}</b>\n` +
+    `${accion} | Stoch 1H:${signal.stoch1H_K.toFixed(1)} 15M:${signal.stoch15M_K.toFixed(1)} 5M:${signal.stoch5M_K.toFixed(1)}\n` +
+    `Tendencia: ${signal.tendencia}`
+
   for (const user of proUsers) {
     const watches = user.watchlist ?? []
     if (!watches.includes(signal.indice)) continue
-    if (!user.pushSubscription) continue
 
-    try {
-      await webpush.sendNotification(
-        user.pushSubscription as webpush.PushSubscription,
-        JSON.stringify({
-          title: `${emoji} Señal ${signal.tipo} — ${indexLabel}`,
-          body: `${accion} | Stoch 1H:${signal.stoch1H_K.toFixed(1)} 15M:${signal.stoch15M_K.toFixed(1)} 5M:${signal.stoch5M_K.toFixed(1)} | ${signal.tendencia}`,
-          icon: '/icon-192.png',
-          badge: '/badge-72.png',
-          data: { url: '/signals' },
-        }),
-      )
-      notifiedUserIds.push(user.PK)
-    } catch (err: unknown) {
-      const statusCode = (err as { statusCode?: number })?.statusCode
-      if (statusCode === 410 || statusCode === 404) {
-        // Subscription expired or no longer valid — remove it to avoid repeated failures
-        await updateItem(TABLES.USERS, { PK: user.PK, SK: 'PROFILE' }, { pushSubscription: null })
-      } else {
-        console.error('Push error for user', user.PK, err)
+    // Push notification
+    if (user.pushSubscription) {
+      try {
+        await webpush.sendNotification(
+          user.pushSubscription as webpush.PushSubscription,
+          JSON.stringify({
+            title: `${emoji} Señal ${signal.tipo} — ${indexLabel}`,
+            body: `${accion} | Stoch 1H:${signal.stoch1H_K.toFixed(1)} 15M:${signal.stoch15M_K.toFixed(1)} 5M:${signal.stoch5M_K.toFixed(1)} | ${signal.tendencia}`,
+            icon: '/icon-192.png',
+            badge: '/badge-72.png',
+            data: { url: '/signals' },
+          }),
+        )
+        notifiedUserIds.push(user.PK)
+      } catch (pushErr: unknown) {
+        const statusCode = (pushErr as { statusCode?: number })?.statusCode
+        if (statusCode === 410 || statusCode === 404) {
+          await updateItem(TABLES.USERS, { PK: user.PK, SK: 'PROFILE' }, { pushSubscription: null })
+        } else {
+          console.error('Push error for user', user.PK, pushErr)
+        }
+      }
+    }
+
+    // Telegram notification
+    if (user.telegramChatId) {
+      try {
+        await sendTelegramMessage(user.telegramChatId, telegramText)
+        if (!notifiedUserIds.includes(user.PK)) notifiedUserIds.push(user.PK)
+      } catch (tgErr: unknown) {
+        console.error('Telegram error for user', user.PK, tgErr)
       }
     }
   }

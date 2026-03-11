@@ -2,9 +2,10 @@ import { useState } from 'react'
 import { useMT5Auth } from '../hooks/useMT5Auth'
 import { useRequestPushPermission } from '../hooks/useSignals'
 import { useAuthStore } from '../store/authStore'
-import { Wifi, Bell, BellOff, User, CreditCard, Shield, Eye, EyeOff, CheckCircle2, AlertCircle } from 'lucide-react'
+import { Wifi, Bell, BellOff, User, CreditCard, Shield, Eye, EyeOff, CheckCircle2, AlertCircle, Send } from 'lucide-react'
 import { formatDate } from '../lib/dateUtils'
 import { useTrialInfo } from '../hooks/useTrades'
+import { telegramApi } from '../lib/api'
 
 const STATUS_LABELS = {
   trial: 'En prueba',
@@ -17,7 +18,7 @@ const SINPE_NUMBER  = import.meta.env.VITE_BANK_INFO_SINPE ?? ''
 const BANK_ACCOUNT  = import.meta.env.VITE_BANK_INFO_CUENTA ?? ''
 
 export function Settings() {
-  const { user } = useAuthStore()
+  const { user, updateUser } = useAuthStore()
   const mt5 = useMT5Auth()
   const requestPush = useRequestPushPermission()
   const { isTrial, daysLeft } = useTrialInfo()
@@ -25,6 +26,9 @@ export function Settings() {
   const [notifPermission, setNotifPermission] = useState<NotificationPermission>(
     typeof Notification !== 'undefined' ? Notification.permission : 'default',
   )
+  const [tgCode, setTgCode] = useState<{ code: string; botUsername: string } | null>(null)
+  const [tgLoading, setTgLoading] = useState(false)
+  const [tgMsg, setTgMsg] = useState<string | null>(null)
 
   const [mt5Login, setMt5Login]       = useState('')
   const [mt5Password, setMt5Password] = useState('')
@@ -38,6 +42,33 @@ export function Settings() {
       setPushMsg('Notificaciones activadas correctamente.')
     } else {
       setPushMsg('No se pudo activar. Revisa los permisos del navegador.')
+    }
+  }
+
+  const handleGetTgCode = async () => {
+    setTgLoading(true)
+    setTgMsg(null)
+    try {
+      const res = await telegramApi.getLinkCode()
+      setTgCode({ code: res.data.code, botUsername: res.data.botUsername })
+    } catch {
+      setTgMsg('Error al generar el código. Intenta de nuevo.')
+    } finally {
+      setTgLoading(false)
+    }
+  }
+
+  const handleTgDisconnect = async () => {
+    setTgLoading(true)
+    try {
+      await telegramApi.disconnect()
+      updateUser({ telegramChatId: undefined })
+      setTgCode(null)
+      setTgMsg('Telegram desvinculado correctamente.')
+    } catch {
+      setTgMsg('Error al desvincular.')
+    } finally {
+      setTgLoading(false)
     }
   }
 
@@ -316,6 +347,81 @@ export function Settings() {
               >
                 Renovar suscripción
               </button>
+            )}
+          </Section>
+        )}
+
+        {/* ── Telegram ── */}
+        {user?.plan === 'pro' && (
+          <Section icon={<Send size={15} />} title="Telegram">
+            <p className="text-sm text-[#6c6d84] mb-4">
+              Recibe las señales directamente en Telegram, incluso cuando la app esté cerrada.
+            </p>
+
+            {user.telegramChatId ? (
+              /* CONNECTED */
+              <div className="flex flex-col gap-3">
+                <div className="flex items-center gap-3 p-3.5 bg-green-50 border border-green-100 rounded-xl">
+                  <div className="w-8 h-8 rounded-full bg-green-100 flex items-center justify-center shrink-0">
+                    <CheckCircle2 size={16} className="text-green-600" />
+                  </div>
+                  <div>
+                    <p className="text-sm font-bold text-green-700">Telegram vinculado</p>
+                    <p className="text-xs text-green-500">Las señales se enviarán a tu chat de Telegram</p>
+                  </div>
+                </div>
+                {tgMsg && <p className="text-xs text-[#6c6d84]">{tgMsg}</p>}
+                <button
+                  onClick={handleTgDisconnect}
+                  disabled={tgLoading}
+                  className="h-9 px-4 border border-[#eeeeee] text-[#6c6d84] hover:border-red-300 hover:text-red-500 text-xs font-semibold rounded-xl transition-colors disabled:opacity-50"
+                >
+                  {tgLoading ? <><Spinner /> Desvinculando...</> : 'Desvincular Telegram'}
+                </button>
+              </div>
+            ) : tgCode ? (
+              /* CODE SHOWN */
+              <div className="flex flex-col gap-4">
+                <ol className="flex flex-col gap-2">
+                  {[
+                    <>Abre Telegram y busca <b>@{tgCode.botUsername}</b></>,
+                    <>Envía este mensaje al bot:</>,
+                  ].map((step, i) => (
+                    <li key={i} className="flex items-start gap-3 text-xs text-[#6c6d84]">
+                      <span className="w-5 h-5 rounded-full bg-[#ff8a71]/15 text-[#ff8a71] font-bold flex items-center justify-center shrink-0 text-xs">
+                        {i + 1}
+                      </span>
+                      <span className="leading-relaxed pt-0.5">{step}</span>
+                    </li>
+                  ))}
+                </ol>
+                <div className="bg-[#f5fafb] border border-[#eeeeee] rounded-xl p-4">
+                  <p className="text-xs text-[#6c6d84] mb-2">Copia y envía este mensaje:</p>
+                  <code className="font-mono font-bold text-base text-[#1a1a2e] select-all">
+                    /start {tgCode.code}
+                  </code>
+                </div>
+                <p className="text-xs text-amber-600">El código expira en 10 minutos. Una vez enviado, el bot confirmará la vinculación.</p>
+                <button
+                  onClick={handleGetTgCode}
+                  disabled={tgLoading}
+                  className="h-9 px-4 border border-[#eeeeee] text-[#6c6d84] text-xs font-semibold rounded-xl transition-colors"
+                >
+                  Generar nuevo código
+                </button>
+              </div>
+            ) : (
+              /* NOT CONNECTED */
+              <div className="flex flex-col gap-3">
+                {tgMsg && <p className="text-xs text-red-500">{tgMsg}</p>}
+                <button
+                  onClick={handleGetTgCode}
+                  disabled={tgLoading}
+                  className="h-11 px-5 bg-[#ff8a71] hover:bg-[#ff9d8a] disabled:opacity-40 text-white text-sm font-bold rounded-xl transition-colors flex items-center gap-2"
+                >
+                  {tgLoading ? <><Spinner color="white" /> Generando...</> : <><Send size={14} /> Vincular Telegram</>}
+                </button>
+              </div>
             )}
           </Section>
         )}

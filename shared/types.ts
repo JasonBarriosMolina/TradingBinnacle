@@ -111,6 +111,9 @@ export interface User {
   createdAt: string
   watchlist: IndexSymbol[]
   pushSubscription?: PushSubscriptionData
+  telegramChatId?: string
+  telegramLinkCode?: string
+  telegramLinkCodeExpires?: string
 }
 
 export interface PushSubscriptionData {

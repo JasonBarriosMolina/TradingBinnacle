@@ -30,6 +30,9 @@ Globals:
         ADMIN_USER_IDS: '{{resolve:ssm:syntra.admin-user-ids}}'
         TOKEN_SECRET: '{{resolve:ssm:syntra.token-secret}}'
         METAAPI_TOKEN: '{{resolve:ssm:syntra.metaapi-token}}'
+        TELEGRAM_BOT_TOKEN: '{{resolve:ssm:syntra.telegram-bot-token}}'
+        TELEGRAM_BOT_USERNAME: '{{resolve:ssm:syntra.telegram-bot-username}}'
+        TELEGRAM_WEBHOOK_SECRET: '{{resolve:ssm:syntra.telegram-webhook-secret}}'
 
 Resources:
   # ─── API Gateway ──────────────────────────────────────────────────────────────
@@ -394,6 +397,7 @@ Resources:
       Handler: dist/signals/get.list
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref SignalsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
       Events:
         List:
           Type: HttpApi
@@ -429,6 +433,43 @@ Resources:
             ApiId: !Ref SyntraApi
             Path: /signals/push-subscription
             Method: POST
+
+  # ─── Telegram Functions ───────────────────────────────────────────────────────
+  TelegramWebhookFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/telegram/webhook.handler
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        Webhook:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /telegram/webhook
+            Method: POST
+            Auth:
+              Authorizer: NONE
+
+  TelegramLinkCodeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: dist/telegram/linkCode.getLinkCode
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref UsersTable }
+      Events:
+        GetCode:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /telegram/link-code
+            Method: GET
+        Disconnect:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref SyntraApi
+            Path: /telegram/disconnect
+            Method: DELETE
 
   # ─── Admin Functions ──────────────────────────────────────────────────────────
   AdminListUsersFunction:

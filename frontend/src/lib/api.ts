@@ -132,6 +132,14 @@ export const signalsApi = {
     api.post('/signals/push-subscription', subscription),
 }
 
+// ─── Telegram endpoints ───────────────────────────────────────────────────────
+export const telegramApi = {
+  getLinkCode: () =>
+    api.get<{ code: string; botUsername: string; expiresAt: string }>('/telegram/link-code'),
+
+  disconnect: () => api.delete('/telegram/disconnect'),
+}
+
 // ─── Stats endpoint ───────────────────────────────────────────────────────────
 export const statsApi = {
   get: () => api.get<import('../shared/types').StatsData>('/stats'),
