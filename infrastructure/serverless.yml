@@ -1,0 +1,670 @@
+service: syntra-backend
+
+frameworkVersion: "3"
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  stage: ${opt:stage, 'dev'}
+  memorySize: 256
+  timeout: 30
+  logRetentionInDays: 14
+
+  iam:
+    role:
+      name: syntra-lambda-execution-role-${self:provider.stage}
+      statements:
+        # DynamoDB — all 4 tables + GSIs
+        - Effect: Allow
+          Action: dynamodb:*
+          Resource:
+            - !GetAtt SyntraUsersTable.Arn
+            - !Sub "${SyntraUsersTable.Arn}/index/*"
+            - !GetAtt SyntraSignalsTable.Arn
+            - !Sub "${SyntraSignalsTable.Arn}/index/*"
+            - !GetAtt SyntraTradesTable.Arn
+            - !Sub "${SyntraTradesTable.Arn}/index/*"
+            - !GetAtt SyntraTickSnapshotsTable.Arn
+            - !Sub "${SyntraTickSnapshotsTable.Arn}/index/*"
+
+        # S3 — ml and data buckets
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+          Resource:
+            - !Sub "${SyntraMlBucket.Arn}/*"
+            - !Sub "${SyntraDataBucket.Arn}/*"
+
+        # Kinesis — ticks stream
+        - Effect: Allow
+          Action:
+            - kinesis:PutRecord
+            - kinesis:GetRecord
+            - kinesis:GetShardIterator
+          Resource: !GetAtt SyntraTicksStream.Arn
+
+        # Timestream
+        - Effect: Allow
+          Action:
+            - timestream:WriteRecords
+            - timestream:Select
+            - timestream:DescribeEndpoints
+          Resource: "*"
+
+        # SageMaker
+        - Effect: Allow
+          Action:
+            - sagemaker:InvokeEndpoint
+            - sagemaker:CreateTrainingJob
+            - sagemaker:DescribeTrainingJob
+          Resource: "*"
+
+        # Bedrock
+        - Effect: Allow
+          Action:
+            - bedrock:InvokeModel
+          Resource: "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5"
+
+        # Forecast
+        - Effect: Allow
+          Action:
+            - forecast:CreateForecast
+            - forecast:CreatePredictor
+            - forecast:QueryForecast
+          Resource: "*"
+
+        # Glue
+        - Effect: Allow
+          Action:
+            - glue:StartJobRun
+            - glue:GetJobRun
+          Resource: "*"
+
+        # SNS
+        - Effect: Allow
+          Action:
+            - sns:Publish
+          Resource: "*"
+
+        # SES
+        - Effect: Allow
+          Action:
+            - ses:SendEmail
+          Resource: "*"
+
+        # Step Functions
+        - Effect: Allow
+          Action:
+            - states:StartExecution
+          Resource: "*"
+
+        # CloudWatch
+        - Effect: Allow
+          Action:
+            - cloudwatch:PutMetricData
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+          Resource: "*"
+
+        # SSM
+        - Effect: Allow
+          Action:
+            - ssm:GetParameter
+          Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/syntra/*"
+
+  environment:
+    STAGE: ${self:provider.stage}
+    AWS_ACCOUNT_ID: !Ref AWS::AccountId
+    DYNAMODB_TABLE_USERS: syntra-users
+    DYNAMODB_TABLE_SIGNALS: syntra-signals
+    DYNAMODB_TABLE_TRADES: syntra-trades
+    DYNAMODB_TABLE_SNAPSHOTS: syntra-tick-snapshots
+    S3_BUCKET_ML: !Ref SyntraMlBucket
+    S3_BUCKET_DATA: !Ref SyntraDataBucket
+    KINESIS_STREAM: !Ref SyntraTicksStream
+    TIMESTREAM_DB: syntra-timestream
+    TIMESTREAM_TABLE: tick-data
+    SCORE_MIN_ENTRY: "65"
+    TELEGRAM_BOT_TOKEN: ${env:TELEGRAM_BOT_TOKEN, ''}
+    DERIV_APP_ID: ${env:DERIV_APP_ID, ''}
+    SINPE_NUMBER: ${env:SINPE_NUMBER, ''}
+    ADMIN_USER_ID: ${env:ADMIN_USER_ID, ''}
+    NOTIFICATION_EMAIL: ${env:NOTIFICATION_EMAIL, ''}
+
+layers:
+  stochCalculator:
+    path: ../backend/layers/stoch-calculator
+    name: syntra-stoch-calculator-${self:provider.stage}
+    description: Stochastic oscillator calculation utilities
+    compatibleRuntimes:
+      - nodejs20.x
+    retain: false
+
+functions:
+  # ── Signal processing ──────────────────────────────────────────────────────
+  signal-worker:
+    handler: handler.handler
+    timeout: 60
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - schedule:
+          # 06:00–24:00 Costa Rica (UTC-6) = 12:00–06:00 UTC next day
+          # Runs every 5 min inside that window
+          rate: cron(0/5 12-23 * * ? *)
+          enabled: true
+          name: syntra-signal-worker-morning-${self:provider.stage}
+          description: Signal worker 06:00-19:00 CR time (12:00-01:00 UTC)
+      - schedule:
+          rate: cron(0/5 0-6 * * ? *)
+          enabled: true
+          name: syntra-signal-worker-evening-${self:provider.stage}
+          description: Signal worker 18:00-24:00 CR time (00:00-06:00 UTC)
+
+  feature-engine:
+    handler: handler.handler
+    timeout: 30
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+
+  ml-scorer:
+    handler: handler.handler
+    timeout: 30
+    memorySize: 512
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+
+  step-orchestrator:
+    handler: handler.handler
+    timeout: 120
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+
+  # ── REST API handlers ──────────────────────────────────────────────────────
+  trades-api:
+    handler: handler.handler
+    timeout: 30
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - http:
+          path: /trades
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /trades
+          method: POST
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /trades/{tradeId}
+          method: PATCH
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /trades/{tradeId}
+          method: DELETE
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  signals-api:
+    handler: handler.handler
+    timeout: 30
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - http:
+          path: /signals
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /signals/{signalId}
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  stats-api:
+    handler: handler.handler
+    timeout: 30
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - http:
+          path: /stats
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /stats/equity
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  forecast-api:
+    handler: handler.handler
+    timeout: 30
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - http:
+          path: /forecast
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  copilot-api:
+    handler: handler.handler
+    timeout: 60
+    memorySize: 512
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - http:
+          path: /copilot/chat
+          method: POST
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  admin-api:
+    handler: handler.handler
+    timeout: 30
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - http:
+          path: /admin/users
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /admin/users/{userId}/plan
+          method: PATCH
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /admin/metrics
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  auth-triggers:
+    handler: handler.handler
+    timeout: 5
+    memorySize: 128
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - http:
+          path: /auth/signup-complete
+          method: POST
+          cors: true
+          # No authorizer — public endpoint
+
+  # ── Scheduled / background ─────────────────────────────────────────────────
+  plan-checker:
+    handler: handler.handler
+    timeout: 60
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - schedule:
+          # 06:00 UTC = 00:00 CR (midnight)
+          rate: cron(0 6 * * ? *)
+          enabled: true
+          name: syntra-plan-checker-${self:provider.stage}
+          description: Daily plan expiry check at midnight CR time
+
+  weekly-report:
+    handler: handler.handler
+    timeout: 120
+    memorySize: 512
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - schedule:
+          # 14:00 UTC Sunday = 08:00 CR Sunday
+          rate: cron(0 14 ? * SUN *)
+          enabled: true
+          name: syntra-weekly-report-${self:provider.stage}
+          description: Weekly user report at 08:00 CR on Sunday
+
+  retraining-job:
+    handler: handler.handler
+    timeout: 120
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - schedule:
+          # 13:00 UTC Sunday = 07:00 CR Sunday
+          rate: cron(0 13 ? * SUN *)
+          enabled: true
+          name: syntra-retraining-job-${self:provider.stage}
+          description: Weekly ML retraining at 07:00 CR on Sunday
+
+  data-collector:
+    handler: handler.handler
+    timeout: 900
+    memorySize: 512
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+
+resources:
+  Resources:
+    # ── DynamoDB Tables ──────────────────────────────────────────────────────
+
+    SyntraUsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-users
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: email
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: email-index
+            KeySchema:
+              - AttributeName: email
+                KeyType: HASH
+              - AttributeName: userId
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    SyntraSignalsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-signals
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: timestampSignalId
+            AttributeType: S
+          - AttributeName: indice
+            AttributeType: S
+          - AttributeName: timestamp
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: timestampSignalId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: indice-index
+            KeySchema:
+              - AttributeName: indice
+                KeyType: HASH
+              - AttributeName: timestamp
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    SyntraTradesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-trades
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: tradeId
+            AttributeType: S
+          - AttributeName: indice
+            AttributeType: S
+          - AttributeName: fecha
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: tradeId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: indice-index
+            KeySchema:
+              - AttributeName: indice
+                KeyType: HASH
+              - AttributeName: fecha
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    SyntraTickSnapshotsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-tick-snapshots
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: symbol
+            AttributeType: S
+          - AttributeName: epoch
+            AttributeType: "N"
+        KeySchema:
+          - AttributeName: symbol
+            KeyType: HASH
+          - AttributeName: epoch
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # ── Cognito ──────────────────────────────────────────────────────────────
+
+    SyntraUserPool:
+      Type: AWS::Cognito::UserPool
+      Properties:
+        UserPoolName: syntra-users-pool
+        AutoVerifiedAttributes:
+          - email
+        UsernameAttributes:
+          - email
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireUppercase: true
+            RequireLowercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Required: true
+            Mutable: true
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+
+    SyntraUserPoolClientWeb:
+      Type: AWS::Cognito::UserPoolClient
+      DependsOn: SyntraUserPool
+      Properties:
+        ClientName: syntra-web-client
+        UserPoolId: !Ref SyntraUserPool
+        GenerateSecret: false
+        ExplicitAuthFlows:
+          - ALLOW_USER_PASSWORD_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+
+    SyntraUserPoolGroupFree:
+      Type: AWS::Cognito::UserPoolGroup
+      DependsOn: SyntraUserPool
+      Properties:
+        GroupName: free
+        UserPoolId: !Ref SyntraUserPool
+        Description: Free plan users
+
+    SyntraUserPoolGroupPro:
+      Type: AWS::Cognito::UserPoolGroup
+      DependsOn: SyntraUserPool
+      Properties:
+        GroupName: pro
+        UserPoolId: !Ref SyntraUserPool
+        Description: Pro plan users
+
+    SyntraUserPoolGroupElite:
+      Type: AWS::Cognito::UserPoolGroup
+      DependsOn: SyntraUserPool
+      Properties:
+        GroupName: elite
+        UserPoolId: !Ref SyntraUserPool
+        Description: Elite plan users
+
+    SyntraUserPoolGroupAdmin:
+      Type: AWS::Cognito::UserPoolGroup
+      DependsOn: SyntraUserPool
+      Properties:
+        GroupName: admin
+        UserPoolId: !Ref SyntraUserPool
+        Description: Admin users
+
+    # ── API Gateway Cognito Authorizer ───────────────────────────────────────
+
+    ApiGatewayAuthorizer:
+      Type: AWS::ApiGateway::Authorizer
+      Properties:
+        Name: syntra-cognito-authorizer
+        RestApiId: !Ref ApiGatewayRestApi
+        Type: COGNITO_USER_POOLS
+        IdentitySource: method.request.header.Authorization
+        ProviderARNs:
+          - !GetAtt SyntraUserPool.Arn
+
+    # ── S3 Buckets ───────────────────────────────────────────────────────────
+
+    SyntraMlBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: syntra-ml-${self:provider.stage}
+        VersioningConfiguration:
+          Status: Enabled
+        LifecycleConfiguration:
+          Rules:
+            - Id: TransitionToIA
+              Status: Enabled
+              Transitions:
+                - TransitionInDays: 30
+                  StorageClass: STANDARD_IA
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    SyntraDataBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: syntra-data-${self:provider.stage}
+        VersioningConfiguration:
+          Status: Enabled
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    # ── Kinesis Data Stream ──────────────────────────────────────────────────
+
+    SyntraTicksStream:
+      Type: AWS::Kinesis::Stream
+      Properties:
+        Name: syntra-ticks-stream
+        ShardCount: 1
+        RetentionPeriodHours: 24
+
+    # ── Timestream ───────────────────────────────────────────────────────────
+
+    SyntraTimestreamDatabase:
+      Type: AWS::Timestream::Database
+      Properties:
+        DatabaseName: syntra-timestream
+
+    SyntraTimestreamTable:
+      Type: AWS::Timestream::Table
+      DependsOn: SyntraTimestreamDatabase
+      Properties:
+        DatabaseName: syntra-timestream
+        TableName: tick-data
+        RetentionProperties:
+          MemoryStoreRetentionPeriodInHours: "24"
+          MagneticStoreRetentionPeriodInDays: "365"
+
+  # ── Stack Outputs ──────────────────────────────────────────────────────────
+
+  Outputs:
+    UserPoolId:
+      Description: Cognito User Pool ID
+      Value: !Ref SyntraUserPool
+      Export:
+        Name: ${self:service}-${self:provider.stage}-UserPoolId
+
+    UserPoolClientId:
+      Description: Cognito User Pool Web Client ID
+      Value: !Ref SyntraUserPoolClientWeb
+      Export:
+        Name: ${self:service}-${self:provider.stage}-UserPoolClientId
+
+    ApiUrl:
+      Description: API Gateway base URL
+      Value:
+        !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}"
+      Export:
+        Name: ${self:service}-${self:provider.stage}-ApiUrl
+
+    SyntraMlBucketName:
+      Description: ML S3 Bucket name
+      Value: !Ref SyntraMlBucket
+      Export:
+        Name: ${self:service}-${self:provider.stage}-SyntraMlBucketName
+
+    SyntraDataBucketName:
+      Description: Data S3 Bucket name
+      Value: !Ref SyntraDataBucket
+      Export:
+        Name: ${self:service}-${self:provider.stage}-SyntraDataBucketName

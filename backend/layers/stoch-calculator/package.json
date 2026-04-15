@@ -1,0 +1,6 @@
+{
+  "name": "stoch-calculator",
+  "version": "1.0.0",
+  "description": "SYNTRA 2.0 — Stochastic 5,3,3 calculator (no external deps)",
+  "main": "index.js"
+}
