@@ -2,6 +2,13 @@ service: syntra-backend
 
 frameworkVersion: "3"
 
+# Each function is packaged separately so signal-worker can bundle ws
+package:
+  individually: true
+  patterns:
+    - "!node_modules/**"
+    - "!.serverless/**"
+
 provider:
   name: aws
   runtime: nodejs20.x
@@ -62,11 +69,14 @@ provider:
             - sagemaker:DescribeTrainingJob
           Resource: "*"
 
-        # Bedrock
+        # Bedrock — InvokeModel on claude-sonnet-4-5 (direct + cross-region inference)
         - Effect: Allow
           Action:
             - bedrock:InvokeModel
-          Resource: "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5"
+            - bedrock:InvokeModelWithResponseStream
+          Resource:
+            - "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5*"
+            - !Sub "arn:aws:bedrock:us-east-1:${AWS::AccountId}:inference-profile/us.anthropic.claude-sonnet-4-5*"
 
         # Forecast
         - Effect: Allow
@@ -149,9 +159,15 @@ functions:
   signal-worker:
     handler: handler.handler
     timeout: 60
-    memorySize: 256
+    memorySize: 512
     layers:
       - !Ref StochCalculatorLambdaLayer
+    # Bundle ws package with this function (not available in Lambda runtime)
+    package:
+      patterns:
+        - "node_modules/ws/**"
+        - "node_modules/bufferutil/**"
+        - "node_modules/utf-8-validate/**"
     events:
       - schedule:
           # 06:00–24:00 Costa Rica (UTC-6) = 12:00–06:00 UTC next day
@@ -179,6 +195,8 @@ functions:
     memorySize: 512
     layers:
       - !Ref StochCalculatorLambdaLayer
+    environment:
+      BEDROCK_MODEL_ID: us.anthropic.claude-sonnet-4-5-20251001-v1:0
 
   step-orchestrator:
     handler: handler.handler
@@ -289,10 +307,19 @@ functions:
     memorySize: 512
     layers:
       - !Ref StochCalculatorLambdaLayer
+    environment:
+      BEDROCK_MODEL_ID: us.anthropic.claude-sonnet-4-5-20251001-v1:0
     events:
       - http:
-          path: /copilot/chat
+          path: /copilot
           method: POST
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /copilot/suggestions
+          method: GET
           cors: true
           authorizer:
             type: COGNITO_USER_POOLS
@@ -361,6 +388,8 @@ functions:
     memorySize: 512
     layers:
       - !Ref StochCalculatorLambdaLayer
+    environment:
+      BEDROCK_MODEL_ID: us.anthropic.claude-sonnet-4-5-20251001-v1:0
     events:
       - schedule:
           # 14:00 UTC Sunday = 08:00 CR Sunday
@@ -423,28 +452,36 @@ resources:
         TableName: syntra-signals
         BillingMode: PAY_PER_REQUEST
         AttributeDefinitions:
+          - AttributeName: signalId
+            AttributeType: S
           - AttributeName: userId
             AttributeType: S
-          - AttributeName: timestampSignalId
+          - AttributeName: created_at
             AttributeType: S
-          - AttributeName: indice
-            AttributeType: S
-          - AttributeName: timestamp
+          - AttributeName: symbol
             AttributeType: S
         KeySchema:
-          - AttributeName: userId
+          - AttributeName: signalId
             KeyType: HASH
-          - AttributeName: timestampSignalId
-            KeyType: RANGE
         GlobalSecondaryIndexes:
-          - IndexName: indice-index
+          # Used by signals-api to list per-user signals
+          - IndexName: userId-created_at-index
             KeySchema:
-              - AttributeName: indice
+              - AttributeName: userId
                 KeyType: HASH
-              - AttributeName: timestamp
+              - AttributeName: created_at
                 KeyType: RANGE
             Projection:
               ProjectionType: ALL
+          # Used by step-orchestrator anti-duplicate check
+          - IndexName: symbol-created_at-index
+            KeySchema:
+              - AttributeName: symbol
+                KeyType: HASH
+              - AttributeName: created_at
+                KeyType: RANGE
+            Projection:
+              ProjectionType: KEYS_ONLY
 
     SyntraTradesTable:
       Type: AWS::DynamoDB::Table
@@ -452,23 +489,20 @@ resources:
         TableName: syntra-trades
         BillingMode: PAY_PER_REQUEST
         AttributeDefinitions:
-          - AttributeName: userId
-            AttributeType: S
           - AttributeName: tradeId
             AttributeType: S
-          - AttributeName: indice
+          - AttributeName: userId
             AttributeType: S
           - AttributeName: fecha
             AttributeType: S
         KeySchema:
-          - AttributeName: userId
-            KeyType: HASH
           - AttributeName: tradeId
-            KeyType: RANGE
+            KeyType: HASH
         GlobalSecondaryIndexes:
-          - IndexName: indice-index
+          # Used by trades-api and stats-api to query per-user trades
+          - IndexName: userId-fecha-index
             KeySchema:
-              - AttributeName: indice
+              - AttributeName: userId
                 KeyType: HASH
               - AttributeName: fecha
                 KeyType: RANGE

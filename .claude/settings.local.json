@@ -203,7 +203,18 @@
       "Bash(cmd.exe /c \"takeown /f \\\\\"D:\\\\InHouse\\\\TradingBinnacle\\\\.aws-sam\\\\\" /r /d y >nul 2>&1 && icacls \\\\\"D:\\\\InHouse\\\\TradingBinnacle\\\\.aws-sam\\\\\" /grant administrators:F /t /q >nul 2>&1 && rmdir /s /q \\\\\"D:\\\\InHouse\\\\TradingBinnacle\\\\.aws-sam\\\\\" && echo OK\")",
       "Bash(cmd.exe /c \"takeown /f \\\\\"D:\\\\\\\\InHouse\\\\\\\\TradingBinnacle\\\\\\\\.aws-sam\\\\\" /r /d y >nul 2>&1 && icacls \\\\\"D:\\\\\\\\InHouse\\\\\\\\TradingBinnacle\\\\\\\\.aws-sam\\\\\" /grant administrators:F /t /q >nul 2>&1 && rmdir /s /q \\\\\"D:\\\\\\\\InHouse\\\\\\\\TradingBinnacle\\\\\\\\.aws-sam\\\\\" && echo OK\")",
       "Bash(powershell.exe -Command \"Remove-Item -Path 'D:\\\\InHouse\\\\TradingBinnacle\\\\.aws-sam' -Recurse -Force -ErrorAction SilentlyContinue; if \\(Test-Path 'D:\\\\InHouse\\\\TradingBinnacle\\\\.aws-sam'\\) { 'STILL EXISTS' } else { 'DELETED' }\")",
-      "Bash(npx create-next-app@14 frontend --typescript --tailwind --app --no-eslint --import-alias \"@/*\" --no-src-dir --yes)"
+      "Bash(npx create-next-app@14 frontend --typescript --tailwind --app --no-eslint --import-alias \"@/*\" --no-src-dir --yes)",
+      "Bash(npx serverless:*)",
+      "Bash(serverless --version)",
+      "Bash(serverless deploy:*)",
+      "Bash(git -C D:\\\\InHouse\\\\TradingBinnacle log --oneline -5)",
+      "Bash(npx next:*)",
+      "Read(//d/InHouse/backend/functions/copilot-api/**)",
+      "Read(//d/InHouse/backend/functions/admin-api/**)",
+      "Read(//d/InHouse/backend/functions/plan-checker/**)",
+      "Read(//d/InHouse/backend/functions/weekly-report/**)",
+      "Bash(node_modules/.bin/tsc --noEmit)",
+      "Bash(node_modules/.bin/next build:*)"
     ]
   }
 }

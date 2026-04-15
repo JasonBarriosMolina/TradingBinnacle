@@ -71,8 +71,30 @@ async function getSignals(event) {
   const signals = (result.Items || []).map(item => {
     const s = unmarshall(item);
     // Strip heavy nested fields for list view
-    const { score_breakdown, tick_snapshot, ...rest } = s;
-    return rest;
+    const { score_breakdown, tick_snapshot, features, ...rest } = s;
+    // Normalize: map backend field names to camelCase for frontend
+    return {
+      ...rest,
+      indice:         rest.symbol || rest.indice,
+      createdAt:      rest.created_at || rest.createdAt,
+      finalScore:     rest.final_score,
+      sagemakerScore: rest.sagemaker_score ?? null,
+      bedrockScore:   rest.bedrock_score   ?? null,
+      journalScore:   rest.journal_score   ?? null,
+      scoreFallback:  rest.score_fallback  ?? true,
+      scoreReason:    rest.score_reason    ?? null,
+      slPuntos:       rest.sl_points,
+      tpPuntos:       rest.tp_points,
+      stoch1H: rest.stoch_1h_k != null
+        ? { k: rest.stoch_1h_k, d: rest.stoch_1h_d }
+        : rest.stoch1H,
+      stoch5M: rest.stoch_5m_k != null
+        ? { k: rest.stoch_5m_k, d: rest.stoch_5m_d }
+        : rest.stoch5M,
+      stoch1M: rest.stoch_1m_k != null
+        ? { k: rest.stoch_1m_k, d: rest.stoch_1m_d }
+        : rest.stoch1M ?? null,
+    };
   });
 
   return ok({ signals, count: signals.length, plan_limit: maxLimit });

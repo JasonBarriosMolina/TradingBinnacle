@@ -115,11 +115,26 @@ exports.handler = async (event) => {
       downgraded   += results.filter(Boolean).length;
     }
 
-    // Telegram notification stub — log for now
-    console.log(JSON.stringify({
-      action: 'telegram_stub',
-      message: `SYNTRA plan-checker: ${downgraded} user(s) downgraded to free at ${now}`,
-    }));
+    // Notify downgraded users via Telegram
+    const telegramToken = process.env.TELEGRAM_BOT_TOKEN || '';
+    if (telegramToken && downgraded > 0) {
+      for (const user of expiredUsers) {
+        if (!user.telegram_chat_id) continue;
+        try {
+          await fetch(`https://api.telegram.org/bot${telegramToken}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              chat_id: user.telegram_chat_id,
+              text: `⚠️ <b>SYNTRA — Plan vencido</b>\n\nTu plan <b>${user.plan?.toUpperCase()}</b> venció el ${user.plan_expires?.slice(0,10)}.\nAhora estás en plan <b>Free</b>.\n\nRenueva en SYNTRA → Upgrade para continuar recibiendo señales. 🚀`,
+              parse_mode: 'HTML',
+            }),
+          });
+        } catch (e) {
+          console.log(JSON.stringify({ action: 'telegramDowngradeWarn', userId: user.userId, error: e.message }));
+        }
+      }
+    }
 
     console.log(JSON.stringify({ action: 'plan-checker done', downgraded, total_expired: expiredUsers.length }));
     return { downgraded, total_expired: expiredUsers.length };

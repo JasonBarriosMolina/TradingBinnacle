@@ -1,0 +1,9 @@
+{
+  "name": "syntra-signal-worker",
+  "version": "1.0.0",
+  "description": "SYNTRA 2.0 — signal-worker Lambda",
+  "main": "handler.js",
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}
