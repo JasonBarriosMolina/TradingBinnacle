@@ -198,6 +198,8 @@ functions:
     handler: backend/functions/ml-scorer/handler.handler
     timeout: 30
     memorySize: 512
+    environment:
+      BEDROCK_MODEL_ID: us.anthropic.claude-sonnet-4-5-20251001-v1:0
 
   step-orchestrator:
     handler: backend/functions/step-orchestrator/handler.handler
@@ -303,10 +305,19 @@ functions:
     handler: backend/functions/copilot-api/handler.handler
     timeout: 60
     memorySize: 512
+    environment:
+      BEDROCK_MODEL_ID: us.anthropic.claude-sonnet-4-5-20251001-v1:0
     events:
       - http:
           path: /copilot/chat
           method: POST
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /copilot/suggestions
+          method: GET
           cors: true
           authorizer:
             type: COGNITO_USER_POOLS
@@ -409,6 +420,52 @@ functions:
           path: /backtest
           method: OPTIONS
           cors: true
+
+  ml-status-api:
+    handler: backend/functions/ml-status-api/handler.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /ml/status
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  users-api:
+    handler: backend/functions/users-api/handler.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /users/me
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /users/me
+          method: PATCH
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  deriv-connect:
+    handler: backend/functions/deriv-connect/handler.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /users/deriv-sync
+          method: POST
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
 
   data-collector:
     handler: backend/functions/data-collector/handler.handler
