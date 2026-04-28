@@ -143,8 +143,20 @@ export const api = {
       }),
     delete: (tradeId: string) =>
       request<void>(`/trades/${tradeId}`, { method: "DELETE" }),
-    mt5SyncNow: () =>
-      request<{ synced: number }>("/trades/mt5-sync-now", { method: "POST" }),
+  },
+
+  users: {
+    me: () => request<UserProfile>("/users/me"),
+    update: (body: Partial<Pick<UserProfile, "whatsapp" | "deriv_token" | "notifications">>) =>
+      request<UserProfile>("/users/me", {
+        method: "PATCH",
+        body: JSON.stringify(body),
+      }),
+    derivSync: () =>
+      request<{ synced: number; skipped: number; account: { loginId: string; currency: string } }>(
+        "/users/deriv-sync",
+        { method: "POST" }
+      ),
   },
 
   signals: {
@@ -182,19 +194,105 @@ export const api = {
     suggestions: () =>
       request<{ suggestions: string[] }>("/copilot/suggestions"),
   },
+
+  ml: {
+    status: () =>
+      request<{
+        symbols: MLSymbolStatus[];
+        summary: { active: number; fallback: number; training: number; error: number };
+      }>("/ml/status"),
+  },
+
+  backtest: {
+    run: (params: BacktestParams) => {
+      const qs = "?" + new URLSearchParams(params as unknown as Record<string, string>).toString();
+      return request<BacktestResult>(`/backtest${qs}`);
+    },
+  },
 };
 
+export interface UserProfile {
+  userId: string;
+  email: string;
+  plan: "free" | "pro" | "elite";
+  whatsapp?: string;
+  deriv_token?: string;
+  deriv_account?: { loginId: string; currency: string; fullname?: string };
+  notifications?: { telegram?: boolean; whatsapp?: boolean };
+  created_at?: string;
+  updated_at?: string;
+}
+
+export interface MLSymbolStatus {
+  symbol: string;
+  displayStatus: "active" | "fallback" | "training" | "error";
+  pipelineStatus: string | null;
+  endpointStatus: string;
+  endpointName: string;
+  trainingJob: string | null;
+  valAuc: number | null;
+  updatedAt: string | null;
+  lastError: string | null;
+}
+
+export interface BacktestParams {
+  symbol: string;
+  candleCount?: string;
+  slPoints?: string;
+  tpPoints?: string;
+  require1m?: string;
+}
+
+export interface BacktestTrade {
+  index: number;
+  epoch: number;
+  entry: number;
+  sl: number;
+  tp: number;
+  result: "WIN" | "LOSS";
+  bars: number;
+  pnl: number;
+}
+
+export interface BacktestStats {
+  total: number;
+  wins: number;
+  losses: number;
+  winRate: number;
+  pnlTotal: number;
+  pnlAvg: number;
+  avgBars: number;
+}
+
+export interface BacktestEquityPoint {
+  index: number;
+  epoch: number;
+  pnl: number;
+  cumulative: number;
+}
+
+export interface BacktestResult {
+  symbol: string;
+  candleCount: number;
+  slPoints: number;
+  tpPoints: number;
+  require1m: boolean;
+  trades: BacktestTrade[];
+  stats: BacktestStats;
+  equity: BacktestEquityPoint[];
+}
+
 export const INDEX_CONFIG = [
-  { value: "CRASH300N",  label: "Crash 300",  type: "crash" },
-  { value: "CRASH500N",  label: "Crash 500",  type: "crash" },
-  { value: "CRASH600N",  label: "Crash 600",  type: "crash" },
-  { value: "CRASH900N",  label: "Crash 900",  type: "crash" },
-  { value: "CRASH1000N", label: "Crash 1000", type: "crash" },
-  { value: "BOOM300N",   label: "Boom 300",   type: "boom"  },
-  { value: "BOOM500N",   label: "Boom 500",   type: "boom"  },
-  { value: "BOOM600N",   label: "Boom 600",   type: "boom"  },
-  { value: "BOOM900N",   label: "Boom 900",   type: "boom"  },
-  { value: "BOOM1000N",  label: "Boom 1000",  type: "boom"  },
+  { value: "CRASH300N", label: "Crash 300",  type: "crash" },
+  { value: "CRASH500",  label: "Crash 500",  type: "crash" },
+  { value: "CRASH600",  label: "Crash 600",  type: "crash" },
+  { value: "CRASH900",  label: "Crash 900",  type: "crash" },
+  { value: "CRASH1000", label: "Crash 1000", type: "crash" },
+  { value: "BOOM300N",  label: "Boom 300",   type: "boom"  },
+  { value: "BOOM500",   label: "Boom 500",   type: "boom"  },
+  { value: "BOOM600",   label: "Boom 600",   type: "boom"  },
+  { value: "BOOM900",   label: "Boom 900",   type: "boom"  },
+  { value: "BOOM1000",  label: "Boom 1000",  type: "boom"  },
 ] as const;
 
 export type IndexValue = (typeof INDEX_CONFIG)[number]["value"];

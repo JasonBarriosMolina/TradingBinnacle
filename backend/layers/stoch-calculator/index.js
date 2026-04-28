@@ -228,12 +228,121 @@ function extractStochFeatures(candles1H, candles5M, candles1M) {
   return features;
 }
 
+/**
+ * Detecta swing highs o swing lows en un array de candles 1H.
+ * Un swing high: su high supera los 'lookback' candles antes y después.
+ * Un swing low:  su low  es menor que los 'lookback' candles antes y después.
+ *
+ * @param {Array<{high,low,close,epoch}>} candles
+ * @param {'high'|'low'} type
+ * @param {number} lookback — candles a cada lado para confirmar el swing (default 2)
+ * @returns {Array<{price:number, epoch:number, index:number}>} — últimos 3 swings
+ */
+function findSwingPoints(candles, type = 'high', lookback = 2) {
+  const points = [];
+  for (let i = lookback; i < candles.length - lookback; i++) {
+    const val = type === 'high' ? candles[i].high : candles[i].low;
+    let isSwing = true;
+    for (let j = i - lookback; j <= i + lookback; j++) {
+      if (j === i) continue;
+      const cmp = type === 'high' ? candles[j].high : candles[j].low;
+      if (type === 'high' && cmp >= val) { isSwing = false; break; }
+      if (type === 'low'  && cmp <= val) { isSwing = false; break; }
+    }
+    if (isSwing) points.push({ price: val, epoch: candles[i].epoch, index: i });
+  }
+  // Devolver los últimos 3 (más recientes)
+  return points.slice(-3);
+}
+
+/**
+ * Calcula la franja de reacción histórica a partir de swing points.
+ * Agrega un buffer del 0.15% a cada lado.
+ *
+ * @param {Array<{price:number}>} swingPoints
+ * @param {number} bufferPct — buffer porcentual (default 0.0015 = 0.15%)
+ * @returns {{ min:number, max:number, mid:number, count:number } | null}
+ */
+function calcReactionZone(swingPoints, bufferPct = 0.0015) {
+  if (!swingPoints || swingPoints.length < 2) return null;
+  const prices = swingPoints.map(p => p.price);
+  const rawMin = Math.min(...prices);
+  const rawMax = Math.max(...prices);
+  const mid    = prices.reduce((a, b) => a + b, 0) / prices.length;
+  return {
+    min:   parseFloat((rawMin * (1 - bufferPct)).toFixed(5)),
+    max:   parseFloat((rawMax * (1 + bufferPct)).toFixed(5)),
+    mid:   parseFloat(mid.toFixed(5)),
+    count: swingPoints.length,
+    levels: prices.map(p => parseFloat(p.toFixed(5))),
+  };
+}
+
+/**
+ * Determina si el precio actual está dentro de la zona de reacción.
+ *
+ * @param {number} currentPrice
+ * @param {{ min:number, max:number } | null} zone
+ * @returns {boolean}
+ */
+function isPriceInZone(currentPrice, zone) {
+  if (!zone) return false;
+  return currentPrice >= zone.min && currentPrice <= zone.max;
+}
+
+/**
+ * Analiza zonas de soporte/resistencia para un símbolo dado.
+ * Para CRASH busca swing highs (techos de rechazo).
+ * Para BOOM  busca swing lows  (pisos de rebote).
+ *
+ * @param {Array<{high,low,close,epoch}>} candles1H — candles 1H recientes
+ * @param {'crash'|'boom'} type
+ * @param {number} currentPrice
+ * @returns {{
+ *   swingPoints: Array,
+ *   zone: { min, max, mid, count, levels } | null,
+ *   priceInZone: boolean,
+ *   distancePct: number | null,
+ *   limitEntry: number | null,
+ * }}
+ */
+function analyzeReactionZone(candles1H, type, currentPrice) {
+  const swingType   = type === 'crash' ? 'high' : 'low';
+  const swingPoints = findSwingPoints(candles1H, swingType, 2);
+  const zone        = calcReactionZone(swingPoints);
+  const priceInZone = isPriceInZone(currentPrice, zone);
+
+  // Distancia del precio actual al mid de la zona (%)
+  let distancePct = null;
+  if (zone) {
+    distancePct = parseFloat((((currentPrice - zone.mid) / zone.mid) * 100).toFixed(3));
+  }
+
+  // Precio de entrada límite sugerido: borde de la zona más cercano al precio
+  let limitEntry = null;
+  if (zone) {
+    if (type === 'crash') {
+      // SELL LIMIT en el borde superior de la zona (resistencia)
+      limitEntry = parseFloat(zone.max.toFixed(5));
+    } else {
+      // BUY LIMIT en el borde inferior de la zona (soporte)
+      limitEntry = parseFloat(zone.min.toFixed(5));
+    }
+  }
+
+  return { swingPoints, zone, priceInZone, distancePct, limitEntry };
+}
+
 module.exports = {
   calcStoch,
   getLastStoch,
   checkEntryCondition,
   extractStochFeatures,
   calcSlope,
+  findSwingPoints,
+  calcReactionZone,
+  isPriceInZone,
+  analyzeReactionZone,
   MIN_CANDLES,
   STOCH_K_PERIOD,
   STOCH_SMOOTH,

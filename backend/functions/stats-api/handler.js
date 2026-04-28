@@ -151,17 +151,24 @@ async function getStats(event) {
   if (capital_actual >= 500  && current_lot < 0.50) lotaje_recomendado = 'Sube a 0.50 cuando llegues a $500';
   if (capital_actual >= 1000 && current_lot < 1.00) lotaje_recomendado = 'Sube a 1.00 cuando llegues a $1,000';
 
+  const losses = total_trades - wins;
+
   return ok({
-    total_trades,
-    win_rate,
-    pnl_semana: Math.round(pnl_semana * 100) / 100,
-    pnl_total:  Math.round(pnl_total  * 100) / 100,
-    rr_promedio,
-    capital_actual,
-    racha_actual,
-    racha_negativa,
-    por_indice,
-    lotaje_recomendado,
+    // camelCase for frontend compatibility
+    totalTrades:     total_trades,
+    wins,
+    losses,
+    winRate:         win_rate,
+    pnlWeek:         Math.round(pnl_semana * 100) / 100,
+    pnlTotal:        Math.round(pnl_total  * 100) / 100,
+    rrPromedio:      rr_promedio,
+    capital:         capital_actual,
+    rachaActual:     racha_actual.count * (racha_actual.tipo === 'win' ? 1 : -1),
+    rachaPositiva:   racha_actual.tipo === 'win' ? racha_actual.count : 0,
+    rachaNegativa:   racha_negativa,
+    porIndice:       por_indice,
+    lotajeSugerido:  user.lotaje_actual || 0.01,
+    lotajeMsg:       lotaje_recomendado,
   });
 }
 
@@ -193,7 +200,8 @@ async function getEquity(event) {
     result.push({ fecha, pnl, acumulado });
   }
 
-  return ok(result);
+  // Map to camelCase for frontend
+  return ok({ points: result.map(p => ({ fecha: p.fecha, pnl: p.pnl, cumulative: p.acumulado })) });
 }
 
 // ── Router ────────────────────────────────────────────────────────────────────

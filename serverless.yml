@@ -1,0 +1,752 @@
+service: syntra-backend
+frameworkVersion: "3"
+
+plugins:
+  - serverless-esbuild
+
+custom:
+  esbuild:
+    bundle: true
+    minify: false
+    sourcemap: false
+    target: node20
+    platform: node
+    external:
+      - "@aws-sdk/*"
+      - "/opt/nodejs/index"
+      - "/opt/nodejs/*"
+    # ws must be bundled (not in Lambda runtime)
+    packager: npm
+    packagerOptions: {}
+    watch:
+      pattern: ["backend/**/*.js"]
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  region: us-east-1
+  stage: ${opt:stage, 'prod'}
+  memorySize: 256
+  timeout: 30
+  logRetentionInDays: 14
+
+  iam:
+    role:
+      name: syntra-lambda-role-${self:provider.stage}
+      statements:
+        - Effect: Allow
+          Action: "dynamodb:*"
+          Resource:
+            - !GetAtt SyntraUsersTable.Arn
+            - !Sub "${SyntraUsersTable.Arn}/index/*"
+            - !GetAtt SyntraSignalsTable.Arn
+            - !Sub "${SyntraSignalsTable.Arn}/index/*"
+            - !GetAtt SyntraTradesTable.Arn
+            - !Sub "${SyntraTradesTable.Arn}/index/*"
+            - !GetAtt SyntraTickSnapshotsTable.Arn
+            - !Sub "${SyntraTickSnapshotsTable.Arn}/index/*"
+
+        - Effect: Allow
+          Action:
+            - s3:GetObject
+            - s3:PutObject
+            - s3:DeleteObject
+            - s3:ListBucket
+          Resource:
+            - !GetAtt SyntraMlBucket.Arn
+            - !Sub "${SyntraMlBucket.Arn}/*"
+            - !GetAtt SyntraDataBucket.Arn
+            - !Sub "${SyntraDataBucket.Arn}/*"
+
+        - Effect: Allow
+          Action:
+            - cognito-idp:AdminAddUserToGroup
+            - cognito-idp:AdminRemoveUserFromGroup
+            - cognito-idp:AdminGetUser
+            - cognito-idp:ListUsers
+            - cognito-idp:ListUsersInGroup
+          Resource: !GetAtt SyntraUserPool.Arn
+
+        - Effect: Allow
+          Action: "dynamodb:*"
+          Resource:
+            - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/syntra-ml-status"
+            - !Sub "arn:aws:dynamodb:${AWS::Region}:${AWS::AccountId}:table/syntra-ml-status/index/*"
+
+        - Effect: Allow
+          Action:
+            - sagemaker:InvokeEndpoint
+            - sagemaker:CreateTrainingJob
+            - sagemaker:DescribeTrainingJob
+            - sagemaker:CreateModel
+            - sagemaker:CreateEndpointConfig
+            - sagemaker:CreateEndpoint
+            - sagemaker:UpdateEndpoint
+            - sagemaker:DescribeEndpoint
+          Resource: "*"
+
+        - Effect: Allow
+          Action:
+            - glue:StartJobRun
+            - glue:GetJobRun
+            - glue:GetJob
+          Resource: "*"
+
+        - Effect: Allow
+          Action: "iam:PassRole"
+          Resource: !GetAtt SageMakerExecutionRole.Arn
+
+        - Effect: Allow
+          Action: "bedrock:InvokeModel"
+          Resource: "arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude-sonnet-4-5"
+
+        - Effect: Allow
+          Action: "lambda:InvokeFunction"
+          Resource: "*"
+
+        - Effect: Allow
+          Action: "sns:Publish"
+          Resource: "*"
+
+        - Effect: Allow
+          Action: "ses:SendEmail"
+          Resource: "*"
+
+        - Effect: Allow
+          Action: "states:StartExecution"
+          Resource: "*"
+
+        - Effect: Allow
+          Action:
+            - logs:CreateLogGroup
+            - logs:CreateLogStream
+            - logs:PutLogEvents
+            - cloudwatch:PutMetricData
+          Resource: "*"
+
+        - Effect: Allow
+          Action: "ssm:GetParameter"
+          Resource: !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/syntra/*"
+
+  environment:
+    STAGE: ${self:provider.stage}
+    DYNAMODB_TABLE_USERS: syntra-users
+    DYNAMODB_TABLE_SIGNALS: syntra-signals
+    DYNAMODB_TABLE_TRADES: syntra-trades
+    DYNAMODB_TABLE_SNAPSHOTS: syntra-tick-snapshots
+    S3_BUCKET_ML: !Ref SyntraMlBucket
+    S3_BUCKET_DATA: !Ref SyntraDataBucket
+    USER_POOL_ID: !Ref SyntraUserPool
+    SCORE_MIN_ENTRY: "65"
+    TELEGRAM_BOT_TOKEN: ${env:TELEGRAM_BOT_TOKEN, ''}
+    TELEGRAM_CHAT_ID: ${env:TELEGRAM_CHAT_ID, ''}
+    ADMIN_TELEGRAM_CHAT_ID: ${env:ADMIN_TELEGRAM_CHAT_ID, ''}
+    DERIV_APP_ID: ${env:DERIV_APP_ID, '1089'}
+    SINPE_NUMBER: ${env:SINPE_NUMBER, ''}
+    ADMIN_USER_ID: ${env:ADMIN_USER_ID, ''}
+    NOTIFICATION_EMAIL: ${env:NOTIFICATION_EMAIL, ''}
+    DYNAMODB_TABLE_ML_STATUS: syntra-ml-status
+    SAGEMAKER_ROLE_ARN: !GetAtt SageMakerExecutionRole.Arn
+    GLUE_JOB_NAME: syntra-tick-etl-${self:provider.stage}
+
+# ── Package ───────────────────────────────────────────────────────────────────
+# serverless-esbuild maneja el packaging con bundle:true — no definir patterns
+# globales para no sobreescribir el output de esbuild.
+package:
+  individually: true
+
+# ── Lambda Layer ──────────────────────────────────────────────────────────────
+layers:
+  stochCalculator:
+    path: backend/layers/stoch-calculator
+    name: syntra-stoch-calculator-${self:provider.stage}
+    description: "Stochastic 5,3,3 — sin librerías externas"
+    compatibleRuntimes:
+      - nodejs20.x
+    retain: false
+
+# ── Functions ─────────────────────────────────────────────────────────────────
+functions:
+
+  # ── Señales (Fase 1 — stubs por ahora) ─────────────────────────────────────
+  signal-worker:
+    handler: backend/functions/signal-worker/handler.handler
+    timeout: 60
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - schedule:
+          rate: cron(0/5 12-23 * * ? *)
+          enabled: true
+          name: syntra-signal-worker-am-${self:provider.stage}
+          description: "Señales 06:00-17:00 CR — activar en Fase 1"
+      - schedule:
+          rate: cron(0/5 0-6 * * ? *)
+          enabled: true
+          name: syntra-signal-worker-pm-${self:provider.stage}
+          description: "Señales 18:00-24:00 CR — activar en Fase 1"
+
+  feature-engine:
+    handler: backend/functions/feature-engine/handler.handler
+    timeout: 30
+    memorySize: 256
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+
+  ml-scorer:
+    handler: backend/functions/ml-scorer/handler.handler
+    timeout: 30
+    memorySize: 512
+
+  step-orchestrator:
+    handler: backend/functions/step-orchestrator/handler.handler
+    timeout: 120
+    memorySize: 256
+
+  # ── API REST ────────────────────────────────────────────────────────────────
+  trades-api:
+    handler: backend/functions/trades-api/handler.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /trades
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /trades
+          method: POST
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /trades/{tradeId}
+          method: PATCH
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /trades/{tradeId}
+          method: DELETE
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  signals-api:
+    handler: backend/functions/signals-api/handler.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /signals
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /signals/{signalId}
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /signals/{signalId}
+          method: PATCH
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  stats-api:
+    handler: backend/functions/stats-api/handler.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /stats
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /stats/equity
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  forecast-api:
+    handler: backend/functions/forecast-api/handler.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /forecast
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  copilot-api:
+    handler: backend/functions/copilot-api/handler.handler
+    timeout: 60
+    memorySize: 512
+    events:
+      - http:
+          path: /copilot/chat
+          method: POST
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  admin-api:
+    handler: backend/functions/admin-api/handler.handler
+    timeout: 30
+    memorySize: 256
+    events:
+      - http:
+          path: /admin/users
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /admin/users/{userId}/plan
+          method: PATCH
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /admin/metrics
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+
+  # ── Cognito triggers — wired via CloudFormation LambdaConfig ───────────────
+  auth-triggers:
+    handler: backend/functions/auth-triggers/handler.handler
+    timeout: 5
+    memorySize: 128
+    # No events aquí — se conecta a Cognito via LambdaConfig en resources
+
+  # ── Scheduled ───────────────────────────────────────────────────────────────
+  plan-checker:
+    handler: backend/functions/plan-checker/handler.handler
+    timeout: 60
+    memorySize: 256
+    events:
+      - schedule:
+          rate: cron(0 6 * * ? *)
+          enabled: true
+          name: syntra-plan-checker-${self:provider.stage}
+          description: "Downgrade planes vencidos — medianoche CR (06:00 UTC)"
+
+  weekly-report:
+    handler: backend/functions/weekly-report/handler.handler
+    timeout: 120
+    memorySize: 512
+    events:
+      - schedule:
+          rate: cron(0 14 ? * SUN *)
+          enabled: true
+          name: syntra-weekly-report-${self:provider.stage}
+          description: "Reporte semanal domingo 08:00 CR"
+
+  retraining-job:
+    handler: backend/functions/retraining-job/handler.handler
+    timeout: 120
+    memorySize: 256
+    events:
+      - schedule:
+          rate: cron(0 13 ? * SUN *)
+          enabled: true
+          name: syntra-retraining-job-${self:provider.stage}
+          description: "Re-entrenamiento ML domingo 07:00 CR"
+
+  retraining-poller:
+    handler: backend/functions/retraining-poller/handler.handler
+    timeout: 300
+    memorySize: 256
+    events:
+      - schedule:
+          rate: cron(0/15 * * * ? *)
+          enabled: true
+          name: syntra-retraining-poller-${self:provider.stage}
+          description: "Avanza pipeline Glue→SageMaker→endpoint cada 15 min"
+
+  backtest-api:
+    handler: backend/functions/backtest-api/handler.handler
+    timeout: 60
+    memorySize: 512
+    layers:
+      - !Ref StochCalculatorLambdaLayer
+    events:
+      - http:
+          path: /backtest
+          method: GET
+          cors: true
+          authorizer:
+            type: COGNITO_USER_POOLS
+            authorizerId: !Ref ApiGatewayAuthorizer
+      - http:
+          path: /backtest
+          method: OPTIONS
+          cors: true
+
+  data-collector:
+    handler: backend/functions/data-collector/handler.handler
+    timeout: 900
+    memorySize: 512
+
+# ── CloudFormation Resources ──────────────────────────────────────────────────
+resources:
+  Resources:
+
+    # ── DynamoDB ───────────────────────────────────────────────────────────────
+
+    SyntraUsersTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-users
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: email
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: email-index
+            KeySchema:
+              - AttributeName: email
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    SyntraSignalsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-signals
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: timestampSignalId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: timestampSignalId
+            KeyType: RANGE
+
+    SyntraTradesTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-trades
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: tradeId
+            AttributeType: S
+          - AttributeName: fecha
+            AttributeType: S
+        KeySchema:
+          - AttributeName: userId
+            KeyType: HASH
+          - AttributeName: tradeId
+            KeyType: RANGE
+        GlobalSecondaryIndexes:
+          - IndexName: userId-fecha-index
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+              - AttributeName: fecha
+                KeyType: RANGE
+            Projection:
+              ProjectionType: ALL
+
+    SyntraMLStatusTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-ml-status
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: symbol
+            AttributeType: S
+        KeySchema:
+          - AttributeName: symbol
+            KeyType: HASH
+
+    SyntraTickSnapshotsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: syntra-tick-snapshots
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: symbol
+            AttributeType: S
+          - AttributeName: epoch
+            AttributeType: "N"
+        KeySchema:
+          - AttributeName: symbol
+            KeyType: HASH
+          - AttributeName: epoch
+            KeyType: RANGE
+        TimeToLiveSpecification:
+          AttributeName: ttl
+          Enabled: true
+
+    # ── SageMaker Execution Role ──────────────────────────────────────────────
+
+    SageMakerExecutionRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: syntra-sagemaker-role-${self:provider.stage}
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sagemaker.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/AmazonSageMakerFullAccess
+        Policies:
+          - PolicyName: SyntraSageMakerS3Access
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
+                  Resource:
+                    - !GetAtt SyntraDataBucket.Arn
+                    - !Sub "${SyntraDataBucket.Arn}/*"
+                    - !GetAtt SyntraMlBucket.Arn
+                    - !Sub "${SyntraMlBucket.Arn}/*"
+
+    # ── Glue ETL Job ──────────────────────────────────────────────────────────
+
+    SyntraGlueETLRole:
+      Type: AWS::IAM::Role
+      Properties:
+        RoleName: syntra-glue-role-${self:provider.stage}
+        AssumeRolePolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: glue.amazonaws.com
+              Action: sts:AssumeRole
+        ManagedPolicyArns:
+          - arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
+        Policies:
+          - PolicyName: SyntraGlueS3Access
+            PolicyDocument:
+              Version: "2012-10-17"
+              Statement:
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:ListBucket
+                    - s3:DeleteObject
+                  Resource:
+                    - !GetAtt SyntraDataBucket.Arn
+                    - !Sub "${SyntraDataBucket.Arn}/*"
+
+    SyntraGlueETLJob:
+      Type: AWS::Glue::Job
+      Properties:
+        Name: syntra-tick-etl-${self:provider.stage}
+        Description: "ETL: raw ticks → features.csv para entrenamiento XGBoost"
+        Role: !GetAtt SyntraGlueETLRole.Arn
+        GlueVersion: "3.0"
+        Command:
+          Name: pythonshell
+          PythonVersion: "3"
+          ScriptLocation: !Sub "s3://${SyntraDataBucket}/scripts/syntra-tick-etl.py"
+        DefaultArguments:
+          "--symbol": "CRASH500"
+          "--stage": "${self:provider.stage}"
+          "--bucket": !Ref SyntraDataBucket
+          "--job-language": "python"
+          "--TempDir": !Sub "s3://${SyntraDataBucket}/glue-temp/"
+        MaxRetries: 0
+        Timeout: 60
+        MaxCapacity: 0.0625
+
+    # ── Cognito ────────────────────────────────────────────────────────────────
+
+    SyntraUserPool:
+      Type: AWS::Cognito::UserPool
+      # DependsOn: AuthDashTriggersLambdaFunction  ← Circular dep — triggers se
+      # configuran DESPUÉS del primer deploy (ver README-DEPLOY.md)
+      Properties:
+        UserPoolName: syntra-users-pool
+        AutoVerifiedAttributes:
+          - email
+        UsernameAttributes:
+          - email
+        Policies:
+          PasswordPolicy:
+            MinimumLength: 8
+            RequireUppercase: true
+            RequireLowercase: true
+            RequireNumbers: true
+            RequireSymbols: false
+        Schema:
+          - Name: email
+            AttributeDataType: String
+            Required: true
+            Mutable: true
+        AccountRecoverySetting:
+          RecoveryMechanisms:
+            - Name: verified_email
+              Priority: 1
+
+    SyntraUserPoolClientWeb:
+      Type: AWS::Cognito::UserPoolClient
+      DependsOn: SyntraUserPool
+      Properties:
+        ClientName: syntra-web-client
+        UserPoolId: !Ref SyntraUserPool
+        GenerateSecret: false
+        ExplicitAuthFlows:
+          - ALLOW_USER_PASSWORD_AUTH
+          - ALLOW_REFRESH_TOKEN_AUTH
+          - ALLOW_USER_SRP_AUTH
+
+    SyntraUserPoolGroupFree:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        GroupName: free
+        UserPoolId: !Ref SyntraUserPool
+        Description: "Plan gratuito"
+
+    SyntraUserPoolGroupPro:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        GroupName: pro
+        UserPoolId: !Ref SyntraUserPool
+        Description: "Plan Pro $9/mes"
+
+    SyntraUserPoolGroupElite:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        GroupName: elite
+        UserPoolId: !Ref SyntraUserPool
+        Description: "Plan Elite $19/mes"
+
+    SyntraUserPoolGroupAdmin:
+      Type: AWS::Cognito::UserPoolGroup
+      Properties:
+        GroupName: admin
+        UserPoolId: !Ref SyntraUserPool
+        Description: "Administradores"
+
+    # NOTA: El permiso para Cognito → Lambda se configura post-deploy:
+    # aws cognito-idp update-user-pool --user-pool-id <ID>
+    #   --lambda-config PreSignUp=<AUTH_TRIGGERS_ARN>,PostConfirmation=<AUTH_TRIGGERS_ARN>
+
+    # ── API Gateway Authorizer ─────────────────────────────────────────────────
+
+    ApiGatewayAuthorizer:
+      Type: AWS::ApiGateway::Authorizer
+      Properties:
+        Name: syntra-cognito-authorizer
+        RestApiId: !Ref ApiGatewayRestApi
+        Type: COGNITO_USER_POOLS
+        IdentitySource: method.request.header.Authorization
+        ProviderARNs:
+          - !GetAtt SyntraUserPool.Arn
+
+    # ── S3 Buckets ─────────────────────────────────────────────────────────────
+
+    SyntraMlBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: syntra-ml-${self:provider.stage}
+        VersioningConfiguration:
+          Status: Enabled
+        LifecycleConfiguration:
+          Rules:
+            - Id: ia-transition
+              Status: Enabled
+              Transitions:
+                - TransitionInDays: 30
+                  StorageClass: STANDARD_IA
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+    SyntraDataBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: syntra-data-${self:provider.stage}
+        VersioningConfiguration:
+          Status: Enabled
+        PublicAccessBlockConfiguration:
+          BlockPublicAcls: true
+          BlockPublicPolicy: true
+          IgnorePublicAcls: true
+          RestrictPublicBuckets: true
+
+  # ── Outputs ────────────────────────────────────────────────────────────────
+  Outputs:
+
+    UserPoolId:
+      Description: Cognito User Pool ID
+      Value: !Ref SyntraUserPool
+      Export:
+        Name: ${self:service}-${self:provider.stage}-UserPoolId
+
+    UserPoolClientId:
+      Description: Cognito App Client ID
+      Value: !Ref SyntraUserPoolClientWeb
+      Export:
+        Name: ${self:service}-${self:provider.stage}-UserPoolClientId
+
+    ApiUrl:
+      Description: URL base del API Gateway
+      Value: !Sub "https://${ApiGatewayRestApi}.execute-api.${AWS::Region}.amazonaws.com/${self:provider.stage}"
+      Export:
+        Name: ${self:service}-${self:provider.stage}-ApiUrl
+
+    # AuthTriggersArn: configurar triggers de Cognito manualmente post-deploy
+    # aws cognito-idp update-user-pool --user-pool-id <ID>
+    #   --lambda-config PreSignUp=<ARN>,PostConfirmation=<ARN>
+
+    SyntraMlBucketName:
+      Value: !Ref SyntraMlBucket
+      Export:
+        Name: ${self:service}-${self:provider.stage}-MlBucket
+
+    SyntraDataBucketName:
+      Value: !Ref SyntraDataBucket
+      Export:
+        Name: ${self:service}-${self:provider.stage}-DataBucket
