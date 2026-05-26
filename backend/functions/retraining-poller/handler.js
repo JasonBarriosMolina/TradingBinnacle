@@ -1,7 +1,7 @@
 'use strict';
 /**
  * SYNTRA 2.0 — retraining-poller (FASE 3)
- * EventBridge cada 15 minutos → avanza el pipeline de retraining.
+ * EventBridge cada 2 horas → avanza el pipeline de retraining.
  *
  * Máquina de estados por símbolo (guardada en syntra-ml-status):
  *   glue_running  → polling Glue → si SUCCEEDED: lanza SageMaker → training
@@ -165,13 +165,10 @@ async function startTrainingJob(symbol) {
       subsample:             '0.8',
       colsample_bytree:      '0.8',
       min_child_weight:      '5',
-      scale_pos_weight:      '10',
+      scale_pos_weight:      '10',   // ~10:1 neg:pos typical for these signals; ETL logs exact ratio
       eval_metric:           'auc',
       early_stopping_rounds: '20',
-      label_col:             'spike_in_next_50t',
-      index_type:            indexType,
     },
-    Tags: [{ Key: 'project', Value: 'syntra' }, { Key: 'symbol', Value: symbol }],
   }));
 
   return jobName;
@@ -266,15 +263,21 @@ exports.handler = async () => {
 
   console.log(JSON.stringify({ action: 'poller-records', count: items.length }));
 
-  // Process each symbol in parallel
-  await Promise.allSettled(items.map(async (rec) => {
-    if (rec.status === 'glue_running') {
-      await checkGlueJob(rec);
-    } else if (rec.status === 'training') {
-      await checkTrainingJob(rec);
+  // Split records by phase
+  const glueRunning = items.filter(r => r.status === 'glue_running');
+  const training    = items.filter(r => r.status === 'training');
+
+  // Poll SageMaker training status in parallel (just DescribeTrainingJob — no rate issues)
+  await Promise.allSettled(training.map(rec => checkTrainingJob(rec)));
+
+  // Poll Glue status sequentially — if a Glue job completes, it calls CreateTrainingJob
+  // which has a strict rate limit (1 req/s). Sequential + delay prevents "Rate exceeded".
+  for (const rec of glueRunning) {
+    await checkGlueJob(rec);
+    if (glueRunning.length > 1) {
+      await new Promise(r => setTimeout(r, 1500)); // 1.5s gap between potential CreateTrainingJob calls
     }
-    // deployed / error / idle → skip
-  }));
+  }
 
   console.log(JSON.stringify({ action: 'retraining-poller-done' }));
 };

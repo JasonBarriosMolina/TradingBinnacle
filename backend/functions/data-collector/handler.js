@@ -1,160 +1,230 @@
 'use strict';
 
 /**
- * SYNTRA 2.0 — data-collector
- * Conecta al Deriv WebSocket API y extrae histórico de ticks
- * para los 10 índices. Guarda en S3 particionado por símbolo/fecha.
+ * SYNTRA 2.0 — data-collector (v3)
+ * Conecta al Deriv WebSocket API y extrae velas OHLC históricas
+ * para los 10 índices en 3 temporalidades: 1H, 15M, 5M.
  *
- * Invocación: manual o EventBridge (una vez por símbolo).
- * Event: { symbol: 'CRASH300N', count: 5000 } o { all: true }
+ * Modos de operación:
+ *   Daily incremental (default): pages = { '1H': 1, '15M': 1, '5M': 1 }
+ *     → solo las últimas velas nuevas
+ *   Historical backfill:         pages = { '1H': 1, '15M': 4, '5M': 10 }
+ *     → ~7 meses 1H, ~6 meses 15M, ~6 meses 5M
+ *
+ * S3 output (ETL deduplica por epoch al leer):
+ *   raw/{SYMBOL}/1H/candles_{ts}.json
+ *   raw/{SYMBOL}/15M/candles_{ts}.json
+ *   raw/{SYMBOL}/5M/candles_{ts}.json
+ *
+ * Event shapes:
+ *   {}                                → incremental, todos los símbolos
+ *   { historical: true }              → backfill 6 meses, todos los símbolos
+ *   { symbol: 'CRASH500' }            → incremental, un símbolo
+ *   { symbol: 'CRASH500', historical: true } → backfill, un símbolo
  */
 
 const { S3Client, PutObjectCommand } = require('@aws-sdk/client-s3');
-const https = require('https');
-const { ALL_SYMBOLS, INDEX_CONFIG } = require('/opt/nodejs/stoch-calculator/../../../src/config/indices');
+const WebSocket = require('ws');
 
-// En Lambda Layer el stoch está en /opt/nodejs/stoch-calculator
-// indices.js se accede vía env o bundled
 const SYMBOLS = process.env.SYMBOLS
   ? process.env.SYMBOLS.split(',')
-  : ['CRASH300N','CRASH500N','CRASH600N','CRASH900N','CRASH1000N',
-     'BOOM300N','BOOM500N','BOOM600N','BOOM900N','BOOM1000N'];
+  : ['CRASH300N','CRASH500','CRASH600','CRASH900','CRASH1000',
+     'BOOM300N','BOOM500','BOOM600','BOOM900','BOOM1000'];
 
-const S3_BUCKET   = process.env.S3_BUCKET_DATA || 'syntra-data-dev';
-const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089'; // demo app id
-const WS_URL      = `wss://ws.binaryws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
+const S3_BUCKET    = process.env.S3_BUCKET_DATA || 'syntra-data-dev';
+const DERIV_APP_ID = process.env.DERIV_APP_ID   || '1089';
+const WS_URL       = `wss://ws.binaryws.com/websockets/v3?app_id=${DERIV_APP_ID}`;
 
 const s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
 
-/**
- * Conecta a Deriv WebSocket y obtiene ticks históricos de un símbolo.
- * @param {string} symbol — e.g. 'CRASH300N'
- * @param {number} count  — número de ticks a obtener (max 5000 por request)
- * @returns {Promise<Array<{epoch: number, quote: number}>>}
- */
-function fetchTickHistory(symbol, count = 5000) {
+// Configuración por temporalidad
+const GRANULARITIES = [
+  { gran: 3600, label: '1H',  count: 5000 },  // 5000 × 1H  = ~208 días
+  { gran: 900,  label: '15M', count: 5000 },  // 5000 × 15M = ~52 días por página
+  { gran: 300,  label: '5M',  count: 5000 },  // 5000 × 5M  = ~17 días por página
+];
+
+// Páginas por temporalidad para backfill histórico (~6 meses)
+const HISTORICAL_PAGES = {
+  '1H':  1,   // 1 × 208 días = ya cubre 7 meses
+  '15M': 4,   // 4 × 52 días  = ~6 meses
+  '5M':  10,  // 10 × 17 días = ~6 meses
+};
+
+// ── WebSocket helper ──────────────────────────────────────────────────────────
+
+function fetchCandles(symbol, granularity, count, endTime = 'latest') {
   return new Promise((resolve, reject) => {
-    // En Lambda no hay WebSocket nativo, usamos https para la API REST de Deriv
-    // Deriv tiene endpoint REST para tick history
-    const endpoint = `https://api.deriv.com/tickHistory/${symbol}?count=${count}&end=latest&style=ticks`;
+    const ws = new WebSocket(WS_URL);
+    let done = false;
 
-    console.log(JSON.stringify({ action: 'fetch_start', symbol, count }));
+    const timer = setTimeout(() => {
+      if (!done) { done = true; ws.terminate(); reject(new Error(`WS timeout ${symbol}/${granularity}`)); }
+    }, 30000);
 
-    // Usamos la API pública de Deriv (no requiere auth para ticks sintéticos)
-    const req = https.get(
-      `https://api.deriv.com/api/v2/tickHistory?symbol=${symbol}&count=${count}&end=latest&style=ticks&app_id=${DERIV_APP_ID}`,
-      (res) => {
-        let data = '';
-        res.on('data', chunk => data += chunk);
-        res.on('end', () => {
-          try {
-            const parsed = JSON.parse(data);
-            if (parsed.error) {
-              reject(new Error(`Deriv API error: ${parsed.error.message}`));
-              return;
-            }
-            // Formato Deriv: { history: { times: [...], prices: [...] } }
-            const times  = parsed.history?.times  || [];
-            const prices = parsed.history?.prices || [];
-            const ticks  = times.map((epoch, i) => ({ epoch, quote: parseFloat(prices[i]) }));
-            console.log(JSON.stringify({ action: 'fetch_complete', symbol, ticks_received: ticks.length }));
-            resolve(ticks);
-          } catch (e) {
-            reject(new Error(`Parse error: ${e.message} — raw: ${data.substring(0, 200)}`));
-          }
-        });
+    ws.on('open', () => {
+      const req = {
+        ticks_history:     symbol,
+        count,
+        granularity,
+        style:             'candles',
+        adjust_start_time: 1,
+      };
+      if (endTime === 'latest') {
+        req.end = 'latest';
+      } else {
+        req.end = endTime; // unix timestamp
       }
-    );
-    req.on('error', reject);
-    req.setTimeout(30000, () => { req.destroy(); reject(new Error('Request timeout')); });
+      ws.send(JSON.stringify(req));
+    });
+
+    ws.on('message', (raw) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      ws.close();
+      try {
+        const msg = JSON.parse(raw.toString());
+        if (msg.error) return reject(new Error(`Deriv [${symbol}/${granularity}]: ${msg.error.message}`));
+        const candles = (msg.candles || []).map(c => ({
+          epoch: c.epoch,
+          open:  parseFloat(c.open),
+          high:  parseFloat(c.high),
+          low:   parseFloat(c.low),
+          close: parseFloat(c.close),
+        }));
+        resolve(candles);
+      } catch (e) {
+        reject(new Error(`Parse error: ${e.message}`));
+      }
+    });
+
+    ws.on('error', (err) => {
+      if (!done) { done = true; clearTimeout(timer); reject(err); }
+    });
   });
 }
 
 /**
- * Sube los ticks de un símbolo a S3.
- * Ruta: s3://syntra-data/{stage}/raw/{symbol}/{YYYY-MM-DD}/ticks_{timestamp}.json
- * @param {string} symbol
- * @param {Array<{epoch:number, quote:number}>} ticks
+ * Fetch N páginas de velas históricas paginando hacia atrás.
+ * Cada página termina justo antes del inicio de la página anterior.
  */
-async function saveToS3(symbol, ticks) {
-  const now  = new Date();
-  const date = now.toISOString().slice(0, 10); // YYYY-MM-DD
-  const ts   = now.getTime();
-  const key  = `raw/${symbol}/${date}/ticks_${ts}.json`;
+async function fetchCandlesHistorical(symbol, granularity, count, pages) {
+  let allCandles = [];
+  let endTime    = 'latest';
 
-  const payload = {
-    symbol,
-    collected_at: now.toISOString(),
-    count: ticks.length,
-    ticks,
-  };
+  for (let page = 0; page < pages; page++) {
+    try {
+      const batch = await fetchCandles(symbol, granularity, count, endTime);
+      if (!batch.length) break;
 
-  await s3.send(new PutObjectCommand({
-    Bucket: S3_BUCKET,
-    Key:    key,
-    Body:   JSON.stringify(payload),
-    ContentType: 'application/json',
-    Metadata: { symbol, date, count: String(ticks.length) },
+      // Prepend older candles al inicio
+      allCandles = [...batch, ...allCandles];
+
+      // Siguiente página termina justo antes del candle más antiguo de este batch
+      endTime = batch[0].epoch - 1;
+
+      console.log(JSON.stringify({
+        action: 'page_fetched', symbol, granularity, page: page + 1,
+        pages, batch_size: batch.length, oldest_epoch: batch[0].epoch,
+      }));
+
+      // Pequeña pausa entre páginas para no saturar la API
+      if (page < pages - 1) await new Promise(r => setTimeout(r, 400));
+    } catch (err) {
+      console.error(JSON.stringify({ action: 'page_error', symbol, granularity, page, error: err.message }));
+      break;
+    }
+  }
+
+  // Deduplicar por epoch (por si hay solapamiento entre páginas)
+  const seen = new Map();
+  for (const c of allCandles) seen.set(c.epoch, c);
+  const deduped = [...seen.values()].sort((a, b) => a.epoch - b.epoch);
+
+  console.log(JSON.stringify({
+    action: 'historical_complete', symbol, granularity,
+    total_candles: deduped.length, pages_fetched: pages,
   }));
 
-  console.log(JSON.stringify({ action: 's3_saved', symbol, key, count: ticks.length }));
+  return deduped;
+}
+
+// ── S3 save ───────────────────────────────────────────────────────────────────
+
+async function saveToS3(symbol, granLabel, candles) {
+  const now = new Date();
+  const key = `raw/${symbol}/${granLabel}/candles_${now.getTime()}.json`;
+
+  await s3.send(new PutObjectCommand({
+    Bucket:      S3_BUCKET,
+    Key:         key,
+    Body:        JSON.stringify({ symbol, gran: granLabel, collected_at: now.toISOString(), count: candles.length, candles }),
+    ContentType: 'application/json',
+    Metadata:    { symbol, gran: granLabel, count: String(candles.length) },
+  }));
+
+  console.log(JSON.stringify({ action: 's3_saved', symbol, gran: granLabel, key, count: candles.length }));
   return key;
 }
 
-/**
- * Procesa un símbolo: fetch + save.
- */
-async function processSymbol(symbol, count) {
+// ── Symbol processor ──────────────────────────────────────────────────────────
+
+async function processSymbol(symbol, isHistorical) {
   try {
-    const ticks = await fetchTickHistory(symbol, count);
-    if (!ticks.length) {
-      console.log(JSON.stringify({ action: 'no_ticks', symbol }));
-      return { symbol, success: false, error: 'No ticks received' };
+    const saved = [];
+
+    // Fetch todas las granularidades — paralelas entre sí, páginas secuenciales dentro de cada una
+    const results = await Promise.allSettled(
+      GRANULARITIES.map(async ({ gran, label, count }) => {
+        const pages = isHistorical ? HISTORICAL_PAGES[label] : 1;
+        const candles = await fetchCandlesHistorical(symbol, gran, count, pages);
+        return { label, candles };
+      })
+    );
+
+    for (const result of results) {
+      if (result.status === 'rejected') {
+        console.error(JSON.stringify({ action: 'fetch_error', symbol, error: result.reason.message }));
+        continue;
+      }
+      const { label, candles } = result.value;
+      if (!candles.length) continue;
+      const key = await saveToS3(symbol, label, candles);
+      saved.push({ gran: label, count: candles.length, key });
     }
-    const key = await saveToS3(symbol, ticks);
-    return { symbol, success: true, key, count: ticks.length };
+
+    return { symbol, success: saved.length > 0, saved };
   } catch (err) {
     console.error(JSON.stringify({ action: 'process_error', symbol, error: err.message }));
     return { symbol, success: false, error: err.message };
   }
 }
 
-/**
- * Handler principal.
- *
- * Event shapes:
- *   { symbol: 'CRASH300N', count: 5000 }   → procesa un símbolo
- *   { all: true, count: 1000 }              → procesa los 10 símbolos
- *   {}                                      → procesa los 10 símbolos con default count
- */
-exports.handler = async (event) => {
-  console.log(JSON.stringify({ action: 'start', event }));
+// ── Handler ───────────────────────────────────────────────────────────────────
 
-  const count  = event.count || 5000;
+exports.handler = async (event) => {
+  const isHistorical = event.historical === true;
+  console.log(JSON.stringify({ action: 'start', isHistorical, event }));
+
   const results = [];
 
   if (event.symbol) {
-    // Procesar un solo símbolo
-    const result = await processSymbol(event.symbol, count);
-    results.push(result);
+    results.push(await processSymbol(event.symbol, isHistorical));
   } else {
-    // Procesar todos — secuencialmente para no saturar la API de Deriv
     const symbols = event.symbols || SYMBOLS;
-    for (const symbol of symbols) {
-      const result = await processSymbol(symbol, count);
-      results.push(result);
-      // Pequeña pausa entre requests para respetar rate limits
-      await new Promise(r => setTimeout(r, 500));
+    // Procesar en lotes de 3 para no saturar la API de Deriv
+    for (let i = 0; i < symbols.length; i += 3) {
+      const batch = symbols.slice(i, i + 3);
+      const batchResults = await Promise.all(batch.map(s => processSymbol(s, isHistorical)));
+      results.push(...batchResults);
+      if (i + 3 < symbols.length) await new Promise(r => setTimeout(r, 1000));
     }
   }
 
   const success = results.filter(r => r.success).length;
   const failed  = results.filter(r => !r.success).length;
 
-  console.log(JSON.stringify({ action: 'complete', success, failed, results }));
-
-  return {
-    statusCode: 200,
-    body: JSON.stringify({ success, failed, results }),
-  };
+  console.log(JSON.stringify({ action: 'complete', isHistorical, success, failed }));
+  return { statusCode: 200, body: JSON.stringify({ success, failed, results }) };
 };

@@ -1,35 +1,51 @@
 'use strict';
 
 /**
- * SYNTRA 2.0 — signal-worker (Fase 1)
+ * SYNTRA 2.0 — signal-worker (v2)
  * EventBridge cada 5 min (06:00–24:00 CR).
- * Obtiene velas Deriv → Stoch(5,3,3) → condición → step-orchestrator.
+ *
+ * Pipeline de filtros (en orden — falla rápido):
+ *   1. Cooldown (< 30 min desde última señal del mismo símbolo)
+ *   2. Tendencia: LH+LL (crash) o HH+HL (boom) en 1H via swing points
+ *   3. Stoch 1H: K & D en zona extrema (> 80 crash / < 20 boom)
+ *   4. Stoch 15M: K & D en zona extrema
+ *   5. Stoch 5M: K & D en zona extrema
+ *   6. Hook: K cruzó D en dirección correcta en 1H o 15M
  */
 
 const WebSocket = require('ws');
 const { LambdaClient, InvokeCommand } = require('@aws-sdk/client-lambda');
+const { DynamoDBClient, GetItemCommand, PutItemCommand } = require('@aws-sdk/client-dynamodb');
 const stoch = require('/opt/nodejs/index');
 
-const DERIV_APP_ID    = process.env.DERIV_APP_ID || '1089';
-const CANDLE_COUNT    = 30;
-const lambdaClient    = new LambdaClient({ region: process.env.AWS_REGION || 'us-east-1' });
+const DERIV_APP_ID = process.env.DERIV_APP_ID || '1089';
+const lambdaClient = new LambdaClient({ region: process.env.AWS_REGION || 'us-east-1' });
+const dynamo       = new DynamoDBClient({ region: process.env.AWS_REGION || 'us-east-1' });
 
-// Todos los símbolos con nombres exactos de Deriv (con sufijo N)
-// Nombres exactos de Deriv: solo 300 lleva sufijo N; el resto sin N
+const ML_TABLE           = process.env.DYNAMODB_TABLE_ML_STATUS || 'syntra-ml-status';
+const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutos
+
+// Más velas 1H para tener suficientes swing points para tendencia
+const CANDLE_COUNT_1H  = 50;
+const CANDLE_COUNT_15M = 30;
+const CANDLE_COUNT_5M  = 30;
+
 const INDEX_CFG = {
-  CRASH300N:  { type: 'crash', direction: 'SELL', require_1m: false, sl_points: 14, tp_points: 28 },
-  CRASH500:   { type: 'crash', direction: 'SELL', require_1m: false, sl_points: 14, tp_points: 28 },
-  CRASH600:   { type: 'crash', direction: 'SELL', require_1m: true,  sl_points: 14, tp_points: 28 },
-  CRASH900:   { type: 'crash', direction: 'SELL', require_1m: true,  sl_points: 14, tp_points: 28 },
-  CRASH1000:  { type: 'crash', direction: 'SELL', require_1m: false, sl_points: 14, tp_points: 28 },
-  BOOM300N:   { type: 'boom',  direction: 'BUY',  require_1m: false, sl_points: 14, tp_points: 28 },
-  BOOM500:    { type: 'boom',  direction: 'BUY',  require_1m: false, sl_points: 14, tp_points: 28 },
-  BOOM600:    { type: 'boom',  direction: 'BUY',  require_1m: true,  sl_points: 14, tp_points: 28 },
-  BOOM900:    { type: 'boom',  direction: 'BUY',  require_1m: true,  sl_points: 14, tp_points: 28 },
-  BOOM1000:   { type: 'boom',  direction: 'BUY',  require_1m: false, sl_points: 14, tp_points: 28 },
+  CRASH300N:  { type: 'crash', direction: 'SELL', sl_points: 14, tp_points: 28 },
+  CRASH500:   { type: 'crash', direction: 'SELL', sl_points: 14, tp_points: 28 },
+  CRASH600:   { type: 'crash', direction: 'SELL', sl_points: 14, tp_points: 28 },
+  CRASH900:   { type: 'crash', direction: 'SELL', sl_points: 14, tp_points: 28 },
+  CRASH1000:  { type: 'crash', direction: 'SELL', sl_points: 14, tp_points: 28 },
+  BOOM300N:   { type: 'boom',  direction: 'BUY',  sl_points: 14, tp_points: 28 },
+  BOOM500:    { type: 'boom',  direction: 'BUY',  sl_points: 14, tp_points: 28 },
+  BOOM600:    { type: 'boom',  direction: 'BUY',  sl_points: 14, tp_points: 28 },
+  BOOM900:    { type: 'boom',  direction: 'BUY',  sl_points: 14, tp_points: 28 },
+  BOOM1000:   { type: 'boom',  direction: 'BUY',  sl_points: 14, tp_points: 28 },
 };
 
-function fetchCandles(symbol, granularity) {
+// ── WebSocket helper ──────────────────────────────────────────────────────────
+
+function fetchCandles(symbol, granularity, count) {
   return new Promise((resolve, reject) => {
     const ws = new WebSocket(`wss://ws.binaryws.com/websockets/v3?app_id=${DERIV_APP_ID}`);
     let done = false;
@@ -41,8 +57,7 @@ function fetchCandles(symbol, granularity) {
     ws.on('open', () => {
       ws.send(JSON.stringify({
         ticks_history: symbol, adjust_start_time: 1,
-        count: CANDLE_COUNT, end: 'latest',
-        granularity, style: 'candles',
+        count, end: 'latest', granularity, style: 'candles',
       }));
     });
 
@@ -58,7 +73,7 @@ function fetchCandles(symbol, granularity) {
         done = true; clearTimeout(timer); ws.close();
         resolve(msg.candles.map(c => ({
           epoch: c.epoch,
-          open:  +c.open, high: +c.high, low: +c.low, close: +c.close,
+          open: +c.open, high: +c.high, low: +c.low, close: +c.close,
         })));
       }
     });
@@ -69,47 +84,197 @@ function fetchCandles(symbol, granularity) {
   });
 }
 
-async function processSymbol(symbol) {
-  const cfg = INDEX_CFG[symbol];
+// ── Cooldown (deduplicación de señales) ───────────────────────────────────────
+
+async function isInCooldown(symbol) {
   try {
-    const [c1H, c5M] = await Promise.all([
-      fetchCandles(symbol, 3600),
-      fetchCandles(symbol, 300),
+    const result = await dynamo.send(new GetItemCommand({
+      TableName: ML_TABLE,
+      Key: { symbol: { S: `signal_cooldown_${symbol}` } },
+    }));
+    if (!result.Item) return false;
+    const lastTs = parseInt(result.Item.last_signal_ts?.N || '0', 10);
+    return Date.now() - lastTs < SIGNAL_COOLDOWN_MS;
+  } catch {
+    return false; // fail open — no bloquear si DDB falla
+  }
+}
+
+async function setSignalCooldown(symbol) {
+  try {
+    await dynamo.send(new PutItemCommand({
+      TableName: ML_TABLE,
+      Item: {
+        symbol:         { S: `signal_cooldown_${symbol}` },
+        last_signal_ts: { N: String(Date.now()) },
+        updated_at:     { S: new Date().toISOString() },
+        status:         { S: 'signal_sent' },
+      },
+    }));
+  } catch (e) {
+    console.error(JSON.stringify({ action: 'cooldown_save_error', symbol, error: e.message }));
+  }
+}
+
+// ── Main symbol processor ─────────────────────────────────────────────────────
+
+async function processSymbol(symbol) {
+  const cfg     = INDEX_CFG[symbol];
+  const isCrash = cfg.type === 'crash';
+
+  try {
+    // ── 1. Cooldown ──────────────────────────────────────────────────────────
+    if (await isInCooldown(symbol)) {
+      return { symbol, triggered: false, reason: 'Cooldown activo (< 30 min)' };
+    }
+
+    // ── 2. Fetch candles (en paralelo) ───────────────────────────────────────
+    const [c1H, c15M, c5M] = await Promise.all([
+      fetchCandles(symbol, 3600, CANDLE_COUNT_1H),
+      fetchCandles(symbol, 900,  CANDLE_COUNT_15M),
+      fetchCandles(symbol, 300,  CANDLE_COUNT_5M),
     ]);
-    const c1M = cfg.require_1m ? await fetchCandles(symbol, 60) : null;
 
-    const s1H = stoch.getLastStoch(c1H);
-    const s5M = stoch.getLastStoch(c5M);
-    const s1M = c1M ? stoch.getLastStoch(c1M) : null;
+    // ── 3. Tendencia: LH+LL (crash) o HH+HL (boom) en 1H ────────────────────
+    const swingHighs = stoch.findSwingPoints(c1H, 'high', 2);
+    const swingLows  = stoch.findSwingPoints(c1H, 'low',  2);
 
-    if (!s1H || !s5M) return { symbol, triggered: false, reason: 'Stoch null' };
+    if (swingHighs.length < 2 || swingLows.length < 2) {
+      return { symbol, triggered: false, reason: 'Insuficientes swing points en 1H para tendencia' };
+    }
 
-    const { valid, reason } = stoch.checkEntryCondition(s1H, s5M, s1M, cfg.type, cfg.require_1m);
-    console.log(JSON.stringify({ action: 'check', symbol, valid, reason, s1H, s5M, s1M }));
-    if (!valid) return { symbol, triggered: false, reason };
+    const lastHigh = swingHighs[swingHighs.length - 1];
+    const prevHigh = swingHighs[swingHighs.length - 2];
+    const lastLow  = swingLows[swingLows.length - 1];
+    const prevLow  = swingLows[swingLows.length - 2];
 
-    const entrada = c1H[c1H.length - 1].close;
-    const sl = cfg.direction === 'SELL' ? +(entrada + cfg.sl_points).toFixed(4) : +(entrada - cfg.sl_points).toFixed(4);
-    const tp = cfg.direction === 'SELL' ? +(entrada - cfg.tp_points).toFixed(4) : +(entrada + cfg.tp_points).toFixed(4);
-    const features = stoch.extractStochFeatures(c1H, c5M, c1M);
-    const zoneAnalysis = stoch.analyzeReactionZone(c1H, cfg.type, entrada);
+    const trendOk = isCrash
+      ? (lastHigh.price < prevHigh.price && lastLow.price < prevLow.price)   // LH + LL
+      : (lastHigh.price > prevHigh.price && lastLow.price > prevLow.price);  // HH + HL
 
-    // Nombre de la función step-orchestrator (mismo prefijo, sufijo cambia)
-    const myName = process.env.AWS_LAMBDA_FUNCTION_NAME || '';
+    if (!trendOk) {
+      const reason = isCrash
+        ? `No LH+LL: H=${lastHigh.price.toFixed(4)}<${prevHigh.price.toFixed(4)}? L=${lastLow.price.toFixed(4)}<${prevLow.price.toFixed(4)}?`
+        : `No HH+HL: H=${lastHigh.price.toFixed(4)}>${prevHigh.price.toFixed(4)}? L=${lastLow.price.toFixed(4)}>${prevLow.price.toFixed(4)}?`;
+      console.log(JSON.stringify({ action: 'check', symbol, triggered: false, reason }));
+      return { symbol, triggered: false, reason };
+    }
+
+    // ── 4. Stoch en todas las TF ──────────────────────────────────────────────
+    const { K: K1H,  D: D1H  } = stoch.calcStoch(c1H);
+    const { K: K15M, D: D15M } = stoch.calcStoch(c15M);
+    const { K: K5M,  D: D5M  } = stoch.calcStoch(c5M);
+
+    const s1H  = stoch.getLastStoch(c1H);
+    const s15M = stoch.getLastStoch(c15M);
+    const s5M  = stoch.getLastStoch(c5M);
+
+    if (!s1H || !s15M || !s5M) {
+      return { symbol, triggered: false, reason: 'Stoch null (candles insuficientes)' };
+    }
+
+    const signal1H   = isCrash ? (s1H.k > 80  && s1H.d > 80)  : (s1H.k < 20  && s1H.d < 20);
+    const confirm15M = isCrash ? (s15M.k > 80 && s15M.d > 80) : (s15M.k < 20 && s15M.d < 20);
+    const entry5M    = isCrash ? (s5M.k > 80  && s5M.d > 80)  : (s5M.k < 20  && s5M.d < 20);
+
+    if (!signal1H)   return { symbol, triggered: false, reason: `1H no en zona: K=${s1H.k.toFixed(1)} D=${s1H.d.toFixed(1)}` };
+    if (!confirm15M) return { symbol, triggered: false, reason: `15M no en zona: K=${s15M.k.toFixed(1)} D=${s15M.d.toFixed(1)}` };
+    if (!entry5M)    return { symbol, triggered: false, reason: `5M no en zona: K=${s5M.k.toFixed(1)} D=${s5M.d.toFixed(1)}` };
+
+    // ── 5. Hook: K cruzó D en dirección correcta ──────────────────────────────
+    const hook1H  = stoch.detectHook(K1H,  D1H,  cfg.type);
+    const hook15M = stoch.detectHook(K15M, D15M, cfg.type);
+
+    if (!hook1H && !hook15M) {
+      return { symbol, triggered: false, reason: 'Sin hook K/D (cruce no confirmado en 1H ni 15M)' };
+    }
+
+    // ── 6. Construir features ─────────────────────────────────────────────────
+    const entrada  = c5M[c5M.length - 1].close;
+    const now      = new Date();
+    const zoneAnal = stoch.analyzeReactionZone(c1H, cfg.type, entrada);
+
+    const lh_magnitude = parseFloat((Math.abs((lastHigh.price - prevHigh.price) / prevHigh.price) * 100).toFixed(4));
+    const hl_magnitude = parseFloat((Math.abs((lastLow.price  - prevLow.price)  / prevLow.price)  * 100).toFixed(4));
+
+    const swingRef          = isCrash ? lastHigh : lastLow;
+    const swingIdx          = c1H.findIndex(c => c.epoch === swingRef.epoch);
+    const candles_since_swing = swingIdx >= 0 ? c1H.length - 1 - swingIdx : 0;
+
+    const momentum_5m = c5M.length >= 6
+      ? parseFloat(((c5M[c5M.length - 1].close - c5M[c5M.length - 6].close) / c5M[c5M.length - 6].close * 100).toFixed(4))
+      : 0;
+
+    const tf_alignment = [signal1H, confirm15M, entry5M].filter(Boolean).length;
+
+    const features = {
+      stoch_1h_k:        s1H.k,
+      stoch_1h_d:        s1H.d,
+      stoch_1h_kd_diff:  parseFloat((s1H.k - s1H.d).toFixed(4)),
+      stoch_1h_d_slope:  parseFloat(stoch.calcSlope(D1H).toFixed(4)),
+
+      stoch_15m_k:       s15M.k,
+      stoch_15m_d:       s15M.d,
+      stoch_15m_kd_diff: parseFloat((s15M.k - s15M.d).toFixed(4)),
+      stoch_15m_d_slope: parseFloat(stoch.calcSlope(D15M).toFixed(4)),
+
+      stoch_5m_k:        s5M.k,
+      stoch_5m_d:        s5M.d,
+      stoch_5m_kd_diff:  parseFloat((s5M.k - s5M.d).toFixed(4)),
+      stoch_5m_d_slope:  parseFloat(stoch.calcSlope(D5M).toFixed(4)),
+
+      tf_alignment,
+      trend_confirmed:   1,
+      lh_magnitude,
+      hl_magnitude,
+
+      hour_of_day:       now.getUTCHours(),
+      day_of_week:       now.getUTCDay(),
+
+      zone_distance_pct: zoneAnal.distancePct ?? 0,
+      price_in_zone:     zoneAnal.priceInZone ? 1 : 0,
+
+      candles_since_swing,
+      momentum_5m,
+
+      stoch_1h_hook:  hook1H,
+      stoch_15m_hook: hook15M,
+    };
+
+    // ── 7. Guardar cooldown ───────────────────────────────────────────────────
+    await setSignalCooldown(symbol);
+
+    // ── 8. Invocar step-orchestrator (fire-and-forget) ────────────────────────
+    const sl = cfg.direction === 'SELL'
+      ? +(entrada + cfg.sl_points).toFixed(4)
+      : +(entrada - cfg.sl_points).toFixed(4);
+    const tp = cfg.direction === 'SELL'
+      ? +(entrada - cfg.tp_points).toFixed(4)
+      : +(entrada + cfg.tp_points).toFixed(4);
+
+    const myName           = process.env.AWS_LAMBDA_FUNCTION_NAME || '';
     const orchestratorName = myName.replace('signal-worker', 'step-orchestrator');
 
     await lambdaClient.send(new InvokeCommand({
-      FunctionName: orchestratorName,
+      FunctionName:   orchestratorName,
       InvocationType: 'Event',
       Payload: Buffer.from(JSON.stringify({
         symbol, tipo: cfg.type.toUpperCase(), direccion: cfg.direction,
         entrada, sl, tp,
         sl_puntos: cfg.sl_points, tp_puntos: cfg.tp_points,
-        stoch_1h_k: s1H.k, stoch_1h_d: s1H.d,
-        stoch_5m_k: s5M.k, stoch_5m_d: s5M.d,
-        stoch_1m_k: s1M?.k ?? null, stoch_1m_d: s1M?.d ?? null,
-        features, zone: zoneAnalysis, timestamp: new Date().toISOString(),
+        stoch_1h_k:  s1H.k,  stoch_1h_d:  s1H.d,
+        stoch_15m_k: s15M.k, stoch_15m_d: s15M.d,
+        stoch_5m_k:  s5M.k,  stoch_5m_d:  s5M.d,
+        hook_1h: hook1H, hook_15m: hook15M,
+        trend_confirmed: 1, tf_alignment,
+        features, zone: zoneAnal, timestamp: new Date().toISOString(),
       })),
+    }));
+
+    console.log(JSON.stringify({
+      action: 'signal_sent', symbol,
+      hook1H, hook15M, tf_alignment,
+      s1H, s15M, s5M,
     }));
     return { symbol, triggered: true, reason: 'OK' };
 
@@ -119,6 +284,8 @@ async function processSymbol(symbol) {
   }
 }
 
+// ── Handler ───────────────────────────────────────────────────────────────────
+
 exports.handler = async () => {
   console.log(JSON.stringify({ action: 'start', ts: new Date().toISOString() }));
   const symbols = Object.keys(INDEX_CFG);
@@ -127,12 +294,12 @@ exports.handler = async () => {
   // Procesar en lotes de 3 para no saturar conexiones WS
   for (let i = 0; i < symbols.length; i += 3) {
     const batch = symbols.slice(i, i + 3);
-    const res = await Promise.all(batch.map(processSymbol));
+    const res   = await Promise.all(batch.map(processSymbol));
     results.push(...res);
     if (i + 3 < symbols.length) await new Promise(r => setTimeout(r, 800));
   }
 
   const triggered = results.filter(r => r.triggered).map(r => r.symbol);
-  console.log(JSON.stringify({ action: 'done', triggered }));
+  console.log(JSON.stringify({ action: 'done', triggered, results }));
   return { triggered };
 };

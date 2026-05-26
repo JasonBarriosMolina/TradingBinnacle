@@ -397,7 +397,7 @@ functions:
     memorySize: 256
     events:
       - schedule:
-          rate: cron(0/15 * * * ? *)
+          rate: cron(0 */2 * * ? *)
           enabled: true
           name: syntra-retraining-poller-${self:provider.stage}
           description: "Avanza pipeline Glue→SageMaker→endpoint cada 15 min"
@@ -471,6 +471,14 @@ functions:
     handler: backend/functions/data-collector/handler.handler
     timeout: 900
     memorySize: 512
+    events:
+      - schedule:
+          rate: cron(0 3 * * ? *)
+          enabled: true
+          name: syntra-data-collector-daily-${self:provider.stage}
+          description: "Recolección diaria incremental de velas OHLC para ML"
+          input:
+            all: true
 
 # ── CloudFormation Resources ──────────────────────────────────────────────────
 resources:

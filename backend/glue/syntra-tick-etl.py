@@ -1,43 +1,51 @@
 """
-SYNTRA 2.0 — syntra-tick-etl
+SYNTRA 2.0 — syntra-tick-etl (v2)
 AWS Glue Python Shell job.
 
-Reads raw Deriv tick data from S3, builds OHLCV candles, computes
-Stoch(5,3,3), extracts feature rows, and writes a labeled CSV for
-XGBoost training.
+Lee velas OHLC multi-temporalidad desde S3, calcula Stoch(5,3,3) en cada
+temporalidad, extrae 24 features por vela 5M y etiqueta si la operacion
+habria sido profitable (TP alcanzado antes que SL).
 
-Glue job arguments (--key value):
-  --symbol   e.g. CRASH500
-  --stage    e.g. prod
-  --bucket   e.g. syntra-ml-data
+S3 input:
+  raw/{SYMBOL}/1H/candles_*.json   -> velas 1H para tendencia + stoch
+  raw/{SYMBOL}/15M/candles_*.json  -> velas 15M para stoch
+  raw/{SYMBOL}/5M/candles_*.json   -> velas 5M para stoch + label + features
+
+S3 output:
+  processed/{SYMBOL}/features.csv  -> label (col 0) + 24 features, sin header
+
+Glue args: --symbol, --stage, --bucket
 """
 
 import sys
 import io
 import json
-import math
 import boto3
-import statistics
+import datetime
 
-# ---------------------------------------------------------------------------
-# Glue arg parsing — works both in Glue and when called with sys.argv locally
-# ---------------------------------------------------------------------------
 from awsglue.utils import getResolvedOptions
 
-args = getResolvedOptions(sys.argv, ['symbol', 'stage', 'bucket'])
+args   = getResolvedOptions(sys.argv, ['symbol', 'stage', 'bucket'])
 SYMBOL = args['symbol'].upper()
 STAGE  = args['stage']
 BUCKET = args['bucket']
 
-print(f"[syntra-tick-etl] symbol={SYMBOL}  stage={STAGE}  bucket={BUCKET}")
+IS_CRASH = SYMBOL.startswith('CRASH')
+
+# SL/TP en puntos (debe coincidir con signal-worker)
+SL_PTS       = 14
+TP_PTS       = 28
+LABEL_WINDOW = 20   # mirar N velas 5M hacia adelante para el label
+
+print(f"[etl-v2] symbol={SYMBOL} is_crash={IS_CRASH} bucket={BUCKET}")
+
+s3 = boto3.client('s3')
 
 # ---------------------------------------------------------------------------
 # S3 helpers
 # ---------------------------------------------------------------------------
-s3 = boto3.client('s3')
 
 def list_s3_keys(prefix):
-    """Return all object keys under prefix (handles pagination)."""
     keys = []
     paginator = s3.get_paginator('list_objects_v2')
     for page in paginator.paginate(Bucket=BUCKET, Prefix=prefix):
@@ -47,111 +55,74 @@ def list_s3_keys(prefix):
 
 
 def read_s3_json(key):
-    """Download an S3 object and parse as JSON."""
     resp = s3.get_object(Bucket=BUCKET, Key=key)
-    body = resp['Body'].read()
-    return json.loads(body)
+    return json.loads(resp['Body'].read())
 
 
 def write_s3_text(key, text):
-    """Upload text content to S3."""
-    s3.put_object(
-        Bucket=BUCKET,
-        Key=key,
-        Body=text.encode('utf-8'),
-        ContentType='text/csv',
-    )
+    s3.put_object(Bucket=BUCKET, Key=key, Body=text.encode('utf-8'), ContentType='text/csv')
 
 # ---------------------------------------------------------------------------
-# Step 1 — Load all raw tick files
-# ---------------------------------------------------------------------------
-raw_prefix = f"raw/{SYMBOL}/"
-print(f"[step-1] Listing keys at s3://{BUCKET}/{raw_prefix} ...")
-keys = list_s3_keys(raw_prefix)
-if not keys:
-    print(f"[step-1] ERROR: No files found at {raw_prefix}")
-    sys.exit(0)
-
-print(f"[step-1] Found {len(keys)} file(s). Loading ticks ...")
-
-ticks = []
-for key in keys:
-    try:
-        data = read_s3_json(key)
-        # Each file is an array of {epoch, quote}
-        if isinstance(data, list):
-            ticks.extend(data)
-        else:
-            print(f"[step-1] WARN: {key} is not a list — skipped")
-    except Exception as exc:
-        print(f"[step-1] WARN: Could not read {key}: {exc}")
-
-if not ticks:
-    print("[step-1] ERROR: Zero ticks loaded.")
-    sys.exit(0)
-
-# Sort by epoch ascending
-ticks.sort(key=lambda t: t['epoch'])
-epochs = [float(t['epoch']) for t in ticks]
-prices = [float(t['quote'])  for t in ticks]
-n_ticks = len(ticks)
-print(f"[step-1] Loaded {n_ticks} ticks spanning epoch "
-      f"{int(epochs[0])}–{int(epochs[-1])}")
-
-# ---------------------------------------------------------------------------
-# Step 2 — Build OHLCV candles from raw ticks
+# Step 1 — Cargar velas de S3 por temporalidad
 # ---------------------------------------------------------------------------
 
-def build_candles(tick_epochs, tick_prices, granularity):
+def load_candles(gran_label):
     """
-    Aggregate ticks into OHLCV candles.
-    granularity: seconds per candle (3600 = 1H, 300 = 5M).
-    Returns list of dicts sorted by candle_epoch ascending.
+    Lee todos los archivos de una temporalidad, junta, deduplica por epoch y ordena.
+    Cada archivo tiene estructura: { candles: [{epoch, open, high, low, close}] }
     """
-    buckets = {}
-    for ep, px in zip(tick_epochs, tick_prices):
-        candle_ep = int(ep // granularity) * granularity
-        if candle_ep not in buckets:
-            buckets[candle_ep] = {'open': px, 'high': px, 'low': px, 'close': px, 'ticks': 1}
-        else:
-            b = buckets[candle_ep]
-            if px > b['high']:  b['high']  = px
-            if px < b['low']:   b['low']   = px
-            b['close'] = px
-            b['ticks'] += 1
+    prefix = f"raw/{SYMBOL}/{gran_label}/"
+    keys   = list_s3_keys(prefix)
+    if not keys:
+        print(f"[load] WARN: No files at {prefix}")
+        return []
 
-    candles = []
-    for ep in sorted(buckets.keys()):
-        b = buckets[ep]
-        candles.append({
-            'epoch': ep,
-            'open':  b['open'],
-            'high':  b['high'],
-            'low':   b['low'],
-            'close': b['close'],
-        })
+    seen = {}
+    for key in keys:
+        try:
+            data = read_s3_json(key)
+            raw  = data.get('candles', data) if isinstance(data, dict) else data
+            for c in raw:
+                ep = int(c['epoch'])
+                if ep not in seen:
+                    seen[ep] = {
+                        'epoch': ep,
+                        'open':  float(c['open']),
+                        'high':  float(c['high']),
+                        'low':   float(c['low']),
+                        'close': float(c['close']),
+                    }
+        except Exception as exc:
+            print(f"[load] WARN: {key}: {exc}")
+
+    candles = sorted(seen.values(), key=lambda c: c['epoch'])
+    print(f"[load] {gran_label}: {len(candles)} candles from {len(keys)} file(s)")
     return candles
 
-print("[step-2] Building 1H and 5M candles ...")
-candles_1h = build_candles(epochs, prices, 3600)
-candles_5m = build_candles(epochs, prices, 300)
-print(f"[step-2] 1H candles: {len(candles_1h)}, 5M candles: {len(candles_5m)}")
+
+print("[step-1] Loading candles ...")
+candles_1h  = load_candles('1H')
+candles_15m = load_candles('15M')
+candles_5m  = load_candles('5M')
+
+if len(candles_5m) < 200:
+    print(f"[step-1] ERROR: Insufficient 5M candles ({len(candles_5m)}). Aborting.")
+    sys.exit(0)
 
 # ---------------------------------------------------------------------------
-# Step 3 — Stochastic (5, 3, 3) implementation
+# Step 2 — Stochastic (5, 3, 3)
 # ---------------------------------------------------------------------------
 
-K_PERIOD = 5
-SMOOTH   = 3
-D_PERIOD = 3
+K_PERIOD    = 5
+SMOOTH      = 3
+D_PERIOD    = 3
 MIN_CANDLES = K_PERIOD + SMOOTH + D_PERIOD - 2  # = 9
 
 
 def sma_series(values, period):
-    """Return SMA series; None for positions without enough data."""
     result = [None] * len(values)
     for i in range(period - 1, len(values)):
-        window = values[i - period + 1 : i + 1]
+        window = values[i - period + 1: i + 1]
         if any(v is None for v in window):
             continue
         result[i] = sum(window) / period
@@ -159,13 +130,8 @@ def sma_series(values, period):
 
 
 def calc_stoch(candles):
-    """
-    Compute Stoch(5,3,3) K and D arrays over the candle list.
-    Returns (K_arr, D_arr) — same length as candles, None where insufficient data.
-    """
-    n = len(candles)
+    n     = len(candles)
     raw_k = [None] * n
-
     for i in range(K_PERIOD - 1, n):
         lo = min(candles[j]['low']  for j in range(i - K_PERIOD + 1, i + 1))
         hi = max(candles[j]['high'] for j in range(i - K_PERIOD + 1, i + 1))
@@ -173,227 +139,269 @@ def calc_stoch(candles):
             raw_k[i] = 50.0
         else:
             raw_k[i] = (candles[i]['close'] - lo) / (hi - lo) * 100.0
-
-    # %K = SMA(3) of raw_k
     K = sma_series(raw_k, SMOOTH)
-
-    # %D = SMA(3) of K
-    D = sma_series(K, D_PERIOD)
-
+    D = sma_series(K,     D_PERIOD)
     return K, D
 
 
-def get_last_stoch(candles):
-    """Return (k, d) for the last valid stoch values, or (None, None)."""
-    if len(candles) < MIN_CANDLES:
-        return None, None
-    K, D = calc_stoch(candles)
-    k = next((v for v in reversed(K) if v is not None), None)
-    d = next((v for v in reversed(D) if v is not None), None)
-    return k, d
+def calc_slope(arr, n=3):
+    valid = [v for v in arr if v is not None][-n:]
+    if len(valid) < 2:
+        return 0.0
+    return (valid[-1] - valid[0]) / (len(valid) - 1)
 
 
-print("[step-3] Computing Stoch(5,3,3) on 1H and 5M candles ...")
+print("[step-2] Computing Stoch(5,3,3) on all TFs ...")
 
-stoch_1h_K, stoch_1h_D = calc_stoch(candles_1h)
-stoch_5m_K, stoch_5m_D = calc_stoch(candles_5m)
+K_1h,  D_1h  = calc_stoch(candles_1h)  if len(candles_1h)  >= MIN_CANDLES else ([], [])
+K_15m, D_15m = calc_stoch(candles_15m) if len(candles_15m) >= MIN_CANDLES else ([], [])
+K_5m,  D_5m  = calc_stoch(candles_5m)
 
-# Build epoch → stoch index maps for fast lookup
-def build_epoch_index(candles):
-    return {c['epoch']: idx for idx, c in enumerate(candles)}
+print(f"[step-2] 1H:{len(K_1h)} 15M:{len(K_15m)} 5M:{len(K_5m)}")
 
-idx_1h = build_epoch_index(candles_1h)
-idx_5m = build_epoch_index(candles_5m)
+# ---------------------------------------------------------------------------
+# Step 3 — Lookup helpers
+# ---------------------------------------------------------------------------
 
-
-def get_stoch_at_epoch(target_epoch, candles, K_arr, D_arr):
+def build_stoch_lookup(candles, K, D):
     """
-    Return (k, d) for the candle whose epoch is closest to and <= target_epoch.
-    Falls back to the last valid value up to that candle.
+    Para cada candle, guarda k, d actuales y k_prev, d_prev (para hook detection).
     """
-    best_idx = None
+    records = []
+    last_valid = {'k': None, 'd': None}
+    prev_valid = {'k': None, 'd': None}
+
+    for i in range(len(candles)):
+        k_curr = K[i] if i < len(K) else None
+        d_curr = D[i] if i < len(D) else None
+
+        rec = {
+            'k':      k_curr if k_curr is not None else last_valid['k'],
+            'd':      d_curr if d_curr is not None else last_valid['d'],
+            'k_prev': prev_valid['k'],
+            'd_prev': prev_valid['d'],
+        }
+        records.append(rec)
+
+        if k_curr is not None and d_curr is not None:
+            prev_valid = dict(last_valid)
+            last_valid = {'k': k_curr, 'd': d_curr}
+
+    return records
+
+
+def get_stoch_at_epoch(target_epoch, candles, records):
+    """Devuelve el record del candle mas reciente con epoch <= target_epoch."""
+    best = None
     for i, c in enumerate(candles):
         if c['epoch'] <= target_epoch:
-            best_idx = i
+            best = records[i]
         else:
             break
-    if best_idx is None:
-        return None, None
-    # Walk backwards from best_idx to find last non-None K and D
-    k = next((K_arr[j] for j in range(best_idx, -1, -1) if K_arr[j] is not None), None)
-    d = next((D_arr[j] for j in range(best_idx, -1, -1) if D_arr[j] is not None), None)
-    return k, d
+    return best
+
+
+def get_d_slope_at_epoch(target_epoch, candles, D_arr, n=3):
+    values = []
+    for i, c in enumerate(candles):
+        if c['epoch'] > target_epoch:
+            break
+        if i < len(D_arr) and D_arr[i] is not None:
+            values.append(D_arr[i])
+    return calc_slope(values, n)
+
+
+print("[step-3] Building lookup tables ...")
+stoch_1h_recs  = build_stoch_lookup(candles_1h,  K_1h,  D_1h)  if candles_1h  else []
+stoch_15m_recs = build_stoch_lookup(candles_15m, K_15m, D_15m) if candles_15m else []
 
 # ---------------------------------------------------------------------------
-# Step 4 — Spike detection on raw ticks
+# Step 4 — Swing point detection
 # ---------------------------------------------------------------------------
-print("[step-4] Detecting spikes ...")
 
-SPIKE_WINDOW = 20
-SPIKE_MULT   = 3.0
-
-# Precompute price changes
-price_changes = [0.0] * n_ticks
-for i in range(1, n_ticks):
-    price_changes[i] = abs(prices[i] - prices[i - 1])
-
-is_spike = [False] * n_ticks
-for i in range(SPIKE_WINDOW, n_ticks):
-    window = price_changes[i - SPIKE_WINDOW : i]
-    try:
-        std = statistics.stdev(window)
-    except statistics.StatisticsError:
-        std = 0.0
-    threshold = SPIKE_MULT * std
-    is_spike[i] = price_changes[i] > threshold if threshold > 0 else False
-
-spike_indices = [i for i, s in enumerate(is_spike) if s]
-print(f"[step-4] Found {len(spike_indices)} spikes in {n_ticks} ticks")
+def find_swing_points(candles, swing_type='high', lookback=2):
+    points = []
+    for i in range(lookback, len(candles) - lookback):
+        val = candles[i]['high'] if swing_type == 'high' else candles[i]['low']
+        is_swing = True
+        for j in range(i - lookback, i + lookback + 1):
+            if j == i:
+                continue
+            cmp = candles[j]['high'] if swing_type == 'high' else candles[j]['low']
+            if swing_type == 'high' and cmp >= val:
+                is_swing = False; break
+            if swing_type == 'low'  and cmp <= val:
+                is_swing = False; break
+        if is_swing:
+            points.append({'price': val, 'epoch': candles[i]['epoch'], 'index': i})
+    return points
 
 # ---------------------------------------------------------------------------
-# Step 5 — Feature extraction
+# Step 5 — Hook detection
 # ---------------------------------------------------------------------------
-print("[step-5] Extracting features ...")
 
-LOOK_BACK_START = 300
-LOOK_AHEAD      = 50
-STEP            = 5
+def detect_hook(record, is_crash):
+    if not record or record['k'] is None or record['d'] is None:
+        return 0
+    if record['k_prev'] is None or record['d_prev'] is None:
+        return 0
+    k, d, kp, dp = record['k'], record['d'], record['k_prev'], record['d_prev']
+    if is_crash:
+        return 1 if (kp > dp and k < d and k > 80) else 0
+    else:
+        return 1 if (kp < dp and k > d and k < 20) else 0
 
-rows = []
+# ---------------------------------------------------------------------------
+# Step 6 — Feature extraction + labeling
+# ---------------------------------------------------------------------------
 
-def safe_std(values):
-    if len(values) < 2:
-        return 0.0
-    try:
-        return statistics.stdev(values)
-    except statistics.StatisticsError:
-        return 0.0
+print("[step-6] Extracting features ...")
 
+BURN_IN = 30
+rows    = []
 
-def safe_mean(values):
-    if not values:
-        return 0.0
-    return sum(values) / len(values)
+for i in range(BURN_IN, len(candles_5m) - LABEL_WINDOW):
+    candle  = candles_5m[i]
+    epoch_i = candle['epoch']
+    close_i = candle['close']
 
-
-for tick_i in range(LOOK_BACK_START, n_ticks - LOOK_AHEAD, STEP):
-    epoch_i = epochs[tick_i]
-
-    # --- Stoch 1H at this tick's epoch ---
-    k_1h, d_1h = get_stoch_at_epoch(epoch_i, candles_1h, stoch_1h_K, stoch_1h_D)
-    if k_1h is None or d_1h is None:
+    # Stoch 1H
+    r1h = get_stoch_at_epoch(epoch_i, candles_1h, stoch_1h_recs)
+    if not r1h or r1h['k'] is None or r1h['d'] is None:
         continue
+    stoch_1h_k       = round(r1h['k'], 6)
+    stoch_1h_d       = round(r1h['d'], 6)
+    stoch_1h_kd_diff = round(r1h['k'] - r1h['d'], 6)
+    stoch_1h_d_slope = round(get_d_slope_at_epoch(epoch_i, candles_1h, D_1h), 6)
+    stoch_1h_hook    = detect_hook(r1h, IS_CRASH)
 
-    # --- Stoch 5M at this tick's epoch ---
-    k_5m, d_5m = get_stoch_at_epoch(epoch_i, candles_5m, stoch_5m_K, stoch_5m_D)
-    if k_5m is None or d_5m is None:
+    # Stoch 15M
+    r15m = get_stoch_at_epoch(epoch_i, candles_15m, stoch_15m_recs)
+    if not r15m or r15m['k'] is None or r15m['d'] is None:
         continue
+    stoch_15m_k       = round(r15m['k'], 6)
+    stoch_15m_d       = round(r15m['d'], 6)
+    stoch_15m_kd_diff = round(r15m['k'] - r15m['d'], 6)
+    stoch_15m_d_slope = round(get_d_slope_at_epoch(epoch_i, candles_15m, D_15m), 6)
+    stoch_15m_hook    = detect_hook(r15m, IS_CRASH)
 
-    # stoch_1m_k / stoch_1m_d — placeholder 50 (no 1M candles in this ETL)
-    k_1m = 50.0
-    d_1m = 50.0
+    # Stoch 5M
+    if i >= len(K_5m) or K_5m[i] is None or D_5m[i] is None:
+        continue
+    stoch_5m_k       = round(K_5m[i], 6)
+    stoch_5m_d       = round(D_5m[i], 6)
+    stoch_5m_kd_diff = round(K_5m[i] - D_5m[i], 6)
+    stoch_5m_d_slope = round(calc_slope(D_5m[:i+1]), 6)
 
-    # --- Ticks since last spike ---
-    prev_spikes = [idx for idx in spike_indices if idx < tick_i]
-    if prev_spikes:
-        ticks_since_last_spike = tick_i - prev_spikes[-1]
+    # TF alignment
+    if IS_CRASH:
+        tf_alignment = int(stoch_1h_k > 80 and stoch_1h_d > 80) + \
+                       int(stoch_15m_k > 80 and stoch_15m_d > 80) + \
+                       int(stoch_5m_k  > 80 and stoch_5m_d  > 80)
     else:
-        ticks_since_last_spike = tick_i  # never spiked before
+        tf_alignment = int(stoch_1h_k < 20 and stoch_1h_d < 20) + \
+                       int(stoch_15m_k < 20 and stoch_15m_d < 20) + \
+                       int(stoch_5m_k  < 20 and stoch_5m_d  < 20)
 
-    # --- Drift velocity (price change over last N ticks) ---
-    drift_velocity_10t = 0.0
-    drift_velocity_50t = 0.0
-    if tick_i >= 10:
-        drift_velocity_10t = prices[tick_i] - prices[tick_i - 10]
-    if tick_i >= 50:
-        drift_velocity_50t = prices[tick_i] - prices[tick_i - 50]
+    # Tendencia en 1H (LH+LL o HH+HL)
+    c1h_sub = [c for c in candles_1h if c['epoch'] <= epoch_i]
+    sh = find_swing_points(c1h_sub, 'high', 2)
+    sl_pts = find_swing_points(c1h_sub, 'low', 2)
 
-    # --- Drift acceleration ---
-    drift_acceleration = 0.0
-    if tick_i >= 20:
-        vel_now  = prices[tick_i]     - prices[tick_i - 10]
-        vel_prev = prices[tick_i - 10] - prices[tick_i - 20]
-        drift_acceleration = vel_now - vel_prev
+    trend_confirmed = 0
+    lh_magnitude    = 0.0
+    hl_magnitude    = 0.0
+    candles_since_swing = 0
 
-    # --- Volatility ---
-    vol_30_changes  = price_changes[max(0, tick_i - 30)  : tick_i]
-    vol_300_changes = price_changes[max(0, tick_i - 300) : tick_i]
-    volatility_30t  = safe_std(vol_30_changes)
-    volatility_300t = safe_std(vol_300_changes)
-    if volatility_300t > 0:
-        volatility_ratio = volatility_30t / volatility_300t
-    else:
-        volatility_ratio = 1.0
+    if len(sh) >= 2 and len(sl_pts) >= 2:
+        last_h, prev_h = sh[-1]['price'], sh[-2]['price']
+        last_l, prev_l = sl_pts[-1]['price'], sl_pts[-2]['price']
+        lh_magnitude = round(abs((last_h - prev_h) / prev_h) * 100, 6)
+        hl_magnitude = round(abs((last_l - prev_l) / prev_l) * 100, 6)
+        if IS_CRASH:
+            trend_confirmed = 1 if (last_h < prev_h and last_l < prev_l) else 0
+        else:
+            trend_confirmed = 1 if (last_h > prev_h and last_l > prev_l) else 0
 
-    # --- Spike magnitude features ---
-    recent_spikes = [idx for idx in spike_indices if idx < tick_i][-5:]  # last 5 spikes
+        last_sw_ep = sh[-1]['epoch'] if IS_CRASH else sl_pts[-1]['epoch']
+        candles_since_swing = sum(1 for c in candles_1h
+                                  if last_sw_ep < c['epoch'] <= epoch_i)
 
-    if recent_spikes:
-        spike_magnitude_last = price_changes[recent_spikes[-1]]
-    else:
-        spike_magnitude_last = 0.0
+    # Temporal
+    dt          = datetime.datetime.utcfromtimestamp(epoch_i)
+    hour_of_day = dt.hour
+    day_of_week = dt.weekday()
 
-    if len(recent_spikes) >= 3:
-        spike_magnitude_avg_3 = safe_mean([price_changes[idx] for idx in recent_spikes[-3:]])
-    else:
-        spike_magnitude_avg_3 = spike_magnitude_last
+    # Zona de reaccion
+    zone_distance_pct = 0.0
+    price_in_zone     = 0
+    ref_swings = sh[-3:] if IS_CRASH else sl_pts[-3:]
+    if len(ref_swings) >= 2:
+        prices   = [s['price'] for s in ref_swings]
+        raw_min  = min(prices)
+        raw_max  = max(prices)
+        mid      = sum(prices) / len(prices)
+        buf      = 0.0015
+        zone_min = raw_min * (1 - buf)
+        zone_max = raw_max * (1 + buf)
+        if mid != 0:
+            zone_distance_pct = round((close_i - mid) / mid * 100, 4)
+        price_in_zone = 1 if (zone_min <= close_i <= zone_max) else 0
 
-    # Inter-spike interval stats (gaps between consecutive spikes)
-    if len(recent_spikes) >= 2:
-        gaps = [recent_spikes[j] - recent_spikes[j - 1] for j in range(1, len(recent_spikes))]
-        inter_spike_avg = safe_mean(gaps)
-        inter_spike_std = safe_std(gaps)
-    else:
-        inter_spike_avg = float(ticks_since_last_spike)
-        inter_spike_std = 0.0
+    # Momentum 5M
+    momentum_5m = 0.0
+    if i >= 5 and candles_5m[i - 5]['close'] != 0:
+        momentum_5m = round(
+            (close_i - candles_5m[i - 5]['close']) / candles_5m[i - 5]['close'] * 100, 6
+        )
 
-    # --- Temporal features ---
-    # epoch_i is in seconds since Unix epoch
-    import datetime
-    dt = datetime.datetime.utcfromtimestamp(epoch_i)
-    hour_of_day  = dt.hour
-    day_of_week  = dt.weekday()  # 0=Mon
+    # Label: trade profitable?
+    entry    = close_i
+    tp_price = entry - TP_PTS if IS_CRASH else entry + TP_PTS
+    sl_price = entry + SL_PTS if IS_CRASH else entry - SL_PTS
 
-    # --- Label: spike in next LOOK_AHEAD ticks ---
-    future_spikes = [idx for idx in spike_indices if tick_i < idx <= tick_i + LOOK_AHEAD]
-    label = 1 if future_spikes else 0
+    label = 0
+    for j in range(i + 1, min(i + 1 + LABEL_WINDOW, len(candles_5m))):
+        c = candles_5m[j]
+        if IS_CRASH:
+            if c['low']  <= tp_price: label = 1; break
+            if c['high'] >= sl_price: label = 0; break
+        else:
+            if c['high'] >= tp_price: label = 1; break
+            if c['low']  <= sl_price: label = 0; break
 
     rows.append([
         label,
-        round(k_1h,  6),
-        round(d_1h,  6),
-        round(k_5m,  6),
-        round(d_5m,  6),
-        round(k_1m,  6),
-        round(d_1m,  6),
-        ticks_since_last_spike,
-        round(drift_velocity_10t,  8),
-        round(drift_velocity_50t,  8),
-        round(drift_acceleration,  8),
-        round(volatility_30t,      8),
-        round(volatility_300t,     8),
-        round(volatility_ratio,    8),
-        round(spike_magnitude_last,  8),
-        round(spike_magnitude_avg_3, 8),
-        round(inter_spike_avg,       4),
-        round(inter_spike_std,       4),
-        hour_of_day,
-        day_of_week,
+        stoch_1h_k,  stoch_1h_d,  stoch_1h_kd_diff,  stoch_1h_d_slope,
+        stoch_15m_k, stoch_15m_d, stoch_15m_kd_diff, stoch_15m_d_slope,
+        stoch_5m_k,  stoch_5m_d,  stoch_5m_kd_diff,  stoch_5m_d_slope,
+        tf_alignment, trend_confirmed,
+        lh_magnitude, hl_magnitude,
+        hour_of_day, day_of_week,
+        zone_distance_pct, price_in_zone,
+        candles_since_swing, momentum_5m,
+        stoch_1h_hook, stoch_15m_hook,
     ])
 
 n_rows = len(rows)
-print(f"[step-5] Generated {n_rows} feature rows")
+print(f"[step-6] Generated {n_rows} feature rows")
 
 # ---------------------------------------------------------------------------
-# Step 6 — Minimum row check
+# Step 7 — Minimo de filas + distribucion de clases
 # ---------------------------------------------------------------------------
 if n_rows < 1000:
-    print(f"[WARN] Only {n_rows} rows generated (minimum 1000 required). "
-          "Increase tick data or lower LOOK_BACK_START. Exiting without writing.")
+    print(f"[WARN] Only {n_rows} rows (minimum 1000). Exiting without writing.")
     sys.exit(0)
 
+positive = sum(1 for r in rows if r[0] == 1)
+negative = n_rows - positive
+scale_pos_weight = round(negative / max(positive, 1), 2)
+print(f"[step-7] Classes — profitable:{positive} ({100*positive//n_rows}%), "
+      f"not:{negative} ({100*negative//n_rows}%)")
+print(f"[step-7] Recommended scale_pos_weight for XGBoost: {scale_pos_weight}")
+
 # ---------------------------------------------------------------------------
-# Step 7 — Write CSV to S3 (no header, label first column)
+# Step 8 — Escribir CSV a S3
 # ---------------------------------------------------------------------------
 out_key = f"processed/{SYMBOL}/features.csv"
 
@@ -401,9 +409,6 @@ buf = io.StringIO()
 for row in rows:
     buf.write(','.join(str(v) for v in row) + '\n')
 
-csv_text = buf.getvalue()
-
-print(f"[step-7] Writing {n_rows} rows to s3://{BUCKET}/{out_key} ...")
-write_s3_text(out_key, csv_text)
-
-print(f"[step-7] Done. {n_rows} rows written to s3://{BUCKET}/{out_key}")
+print(f"[step-8] Writing {n_rows} rows -> s3://{BUCKET}/{out_key} ...")
+write_s3_text(out_key, buf.getvalue())
+print(f"[step-8] Done. {n_rows} rows, {len(rows[0])-1} features, label=col0.")
