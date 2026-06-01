@@ -7,10 +7,9 @@
  * Pipeline de filtros (en orden — falla rápido):
  *   1. Cooldown (< 30 min desde última señal del mismo símbolo)
  *   2. Tendencia: LH+LL (crash) o HH+HL (boom) en 1H via swing points
- *   3. Stoch 1H: K & D en zona extrema (> 80 crash / < 20 boom)
- *   4. Stoch 15M: K & D en zona extrema
- *   5. Stoch 5M: K & D en zona extrema
- *   6. Hook: K cruzó D en dirección correcta en 1H o 15M
+ *   3. DOS ESTRATEGIAS EN PARALELO — señal si CUALQUIERA pasa:
+ *      A. Zona extrema: 1H K>80 + 15M K>80 + 5M K>80 + hook K/D en 1H o 15M
+ *      B. Trend+crossover: K cruzó D en 1H o 15M (cualquier nivel) + crossover 5M confirma
  */
 
 const WebSocket = require('ws');
@@ -23,7 +22,7 @@ const lambdaClient = new LambdaClient({ region: process.env.AWS_REGION || 'us-ea
 const dynamo       = new DynamoDBClient({ region: process.env.AWS_REGION || 'us-east-1' });
 
 const ML_TABLE           = process.env.DYNAMODB_TABLE_ML_STATUS || 'syntra-ml-status';
-const SIGNAL_COOLDOWN_MS = 30 * 60 * 1000; // 30 minutos
+const SIGNAL_COOLDOWN_MS = 20 * 60 * 1000; // 20 minutos
 
 // Más velas 1H para tener suficientes swing points para tendencia
 const CANDLE_COUNT_1H  = 50;
@@ -173,21 +172,31 @@ async function processSymbol(symbol) {
       return { symbol, triggered: false, reason: 'Stoch null (candles insuficientes)' };
     }
 
-    const signal1H   = isCrash ? (s1H.k > 80  && s1H.d > 80)  : (s1H.k < 20  && s1H.d < 20);
-    const confirm15M = isCrash ? (s15M.k > 80 && s15M.d > 80) : (s15M.k < 20 && s15M.d < 20);
-    const entry5M    = isCrash ? (s5M.k > 80  && s5M.d > 80)  : (s5M.k < 20  && s5M.d < 20);
+    // ── 4-5. Dos estrategias en paralelo — señal si CUALQUIERA pasa ───────────
 
-    if (!signal1H)   return { symbol, triggered: false, reason: `1H no en zona: K=${s1H.k.toFixed(1)} D=${s1H.d.toFixed(1)}` };
-    if (!confirm15M) return { symbol, triggered: false, reason: `15M no en zona: K=${s15M.k.toFixed(1)} D=${s15M.d.toFixed(1)}` };
-    if (!entry5M)    return { symbol, triggered: false, reason: `5M no en zona: K=${s5M.k.toFixed(1)} D=${s5M.d.toFixed(1)}` };
-
-    // ── 5. Hook: K cruzó D en dirección correcta ──────────────────────────────
+    // Estrategia A: Zona extrema estricta (1H + 15M + 5M en zona >80/<20 + hook K/D dentro de zona)
+    const zone1H  = isCrash ? (s1H.k > 80  && s1H.d > 80)  : (s1H.k < 20  && s1H.d < 20);
+    const zone15M = isCrash ? (s15M.k > 80 && s15M.d > 80) : (s15M.k < 20 && s15M.d < 20);
+    const zone5M  = isCrash ? (s5M.k > 80)                  : (s5M.k < 20);
     const hook1H  = stoch.detectHook(K1H,  D1H,  cfg.type);
     const hook15M = stoch.detectHook(K15M, D15M, cfg.type);
+    const estrategiaA = zone1H && zone15M && zone5M && (hook1H || hook15M);
 
-    if (!hook1H && !hook15M) {
-      return { symbol, triggered: false, reason: 'Sin hook K/D (cruce no confirmado en 1H ni 15M)' };
+    // Estrategia B: Tendencia confirmada por swing points en 1H (sin validar stoch 1H)
+    //   + dirección estricta del stoch en 5M y 15M alineados con la tendencia
+    //   CRASH: K < D en 5M y 15M → presión bajista activa en ambos TF
+    //   BOOM:  K > D en 5M y 15M → presión alcista activa en ambos TF
+    const cross1H      = stoch.detectCrossoverAny(K1H,  D1H,  cfg.type); // solo para log
+    const trend5M_B    = isCrash ? s5M.k  < s5M.d  : s5M.k  > s5M.d;
+    const trend15M_B   = isCrash ? s15M.k < s15M.d : s15M.k > s15M.d;
+    const estrategiaB  = trend5M_B && trend15M_B;
+
+    if (!estrategiaA && !estrategiaB) {
+      return { symbol, triggered: false,
+        reason: `Sin setup: 1H K=${s1H.k.toFixed(1)}/D=${s1H.d.toFixed(1)} 15M K=${s15M.k.toFixed(1)}/D=${s15M.d.toFixed(1)}` };
     }
+
+    const strategyLabel = estrategiaA ? 'zona_extrema' : 'trend_crossover';
 
     // ── 6. Construir features ─────────────────────────────────────────────────
     const entrada  = c5M[c5M.length - 1].close;
@@ -205,7 +214,11 @@ async function processSymbol(symbol) {
       ? parseFloat(((c5M[c5M.length - 1].close - c5M[c5M.length - 6].close) / c5M[c5M.length - 6].close * 100).toFixed(4))
       : 0;
 
-    const tf_alignment = [signal1H, confirm15M, entry5M].filter(Boolean).length;
+    // tf_alignment: cuántos TF tienen K en relación correcta con D (K<D crash, K>D boom)
+    const kBelowD1H  = isCrash ? s1H.k  < s1H.d  : s1H.k  > s1H.d;
+    const kBelowD15M = isCrash ? s15M.k < s15M.d : s15M.k > s15M.d;
+    const kBelowD5M  = isCrash ? s5M.k  < s5M.d  : s5M.k  > s5M.d;
+    const tf_alignment = [kBelowD1H, kBelowD15M, kBelowD5M].filter(Boolean).length;
 
     const features = {
       stoch_1h_k:        s1H.k,
@@ -237,7 +250,7 @@ async function processSymbol(symbol) {
       candles_since_swing,
       momentum_5m,
 
-      stoch_1h_hook:  hook1H,
+      stoch_1h_hook:  hook1H  || cross1H,
       stoch_15m_hook: hook15M,
     };
 
@@ -265,15 +278,16 @@ async function processSymbol(symbol) {
         stoch_1h_k:  s1H.k,  stoch_1h_d:  s1H.d,
         stoch_15m_k: s15M.k, stoch_15m_d: s15M.d,
         stoch_5m_k:  s5M.k,  stoch_5m_d:  s5M.d,
-        hook_1h: hook1H, hook_15m: hook15M,
+        hook_1h: hook1H || cross1H, hook_15m: hook15M,
         trend_confirmed: 1, tf_alignment,
+        strategy: strategyLabel,
         features, zone: zoneAnal, timestamp: new Date().toISOString(),
       })),
     }));
 
     console.log(JSON.stringify({
-      action: 'signal_sent', symbol,
-      hook1H, hook15M, tf_alignment,
+      action: 'signal_sent', symbol, strategy: strategyLabel,
+      estrategiaA, estrategiaB, tf_alignment,
       s1H, s15M, s5M,
     }));
     return { symbol, triggered: true, reason: 'OK' };
@@ -281,6 +295,94 @@ async function processSymbol(symbol) {
   } catch (err) {
     console.error(JSON.stringify({ action: 'error', symbol, error: err.message }));
     return { symbol, triggered: false, reason: err.message };
+  }
+}
+
+// ── Heartbeat (status cada 2 horas si no hay señales) ────────────────────────
+
+const HEARTBEAT_KEY     = 'heartbeat_status';
+const HEARTBEAT_GAP_MS  = 2 * 60 * 60 * 1000; // 2 horas
+const BOT_TOKEN         = process.env.TELEGRAM_BOT_TOKEN  || '';
+const ADMIN_CHAT_ID     = process.env.ADMIN_TELEGRAM_CHAT_ID || '';
+
+async function shouldSendHeartbeat() {
+  try {
+    const result = await dynamo.send(new GetItemCommand({
+      TableName: ML_TABLE,
+      Key: { symbol: { S: HEARTBEAT_KEY } },
+    }));
+    if (!result.Item) return true;
+    const lastTs = parseInt(result.Item.last_signal_ts?.N || '0', 10);
+    return Date.now() - lastTs >= HEARTBEAT_GAP_MS;
+  } catch { return false; }
+}
+
+async function markHeartbeatSent() {
+  try {
+    await dynamo.send(new PutItemCommand({
+      TableName: ML_TABLE,
+      Item: {
+        symbol:         { S: HEARTBEAT_KEY },
+        last_signal_ts: { N: String(Date.now()) },
+        updated_at:     { S: new Date().toISOString() },
+        status:         { S: 'heartbeat' },
+      },
+    }));
+  } catch { /* non-critical */ }
+}
+
+function buildHeartbeatMessage(results) {
+  const now = new Date().toLocaleString('es-CR', {
+    timeZone: 'America/Costa_Rica',
+    weekday: 'short', day: '2-digit', month: 'short',
+    hour: '2-digit', minute: '2-digit',
+  });
+
+  // Clasifica cada símbolo por el filtro que lo bloqueó
+  const noTrend    = results.filter(r => r.reason?.includes('LH+LL') || r.reason?.includes('HH+HL') || r.reason?.includes('swing'));
+  const noSetup    = results.filter(r => r.reason?.includes('Sin setup'));
+  const cooldown   = results.filter(r => r.reason?.includes('Cooldown'));
+
+  let msg = `🔍 <b>SYNTRA — Sin señales</b>\n`;
+  msg += `🕐 ${now}\n`;
+  msg += `─────────────────────────\n`;
+
+  if (noTrend.length) {
+    msg += `\n📉 <b>Sin tendencia confirmada (${noTrend.length}):</b>\n`;
+    msg += noTrend.map(r => `   ${r.symbol}`).join('\n') + '\n';
+  }
+
+  if (noSetup.length) {
+    msg += `\n📊 <b>Tendencia ✅ · Sin setup A ni B (${noSetup.length}):</b>\n`;
+    msg += noSetup.map(r => {
+      const match = r.reason?.match(/1H K=([\d.]+)\/D=([\d.]+)/);
+      const vals = match ? ` 1H K=${match[1]} D=${match[2]}` : '';
+      return `   ${r.symbol}${vals}`;
+    }).join('\n') + '\n';
+  }
+
+  if (cooldown.length) {
+    msg += `\n⏳ <b>Cooldown activo (${cooldown.length}):</b>\n`;
+    msg += cooldown.map(r => `   ${r.symbol}`).join('\n') + '\n';
+  }
+
+  msg += `\n─────────────────────────\n`;
+  msg += `👁 Monitoreando 10 índices · cada 5 min`;
+
+  return msg;
+}
+
+async function sendHeartbeat(msg) {
+  if (!BOT_TOKEN || !ADMIN_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`, {
+      method:  'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body:    JSON.stringify({ chat_id: ADMIN_CHAT_ID, text: msg, parse_mode: 'HTML' }),
+    });
+    console.log(JSON.stringify({ action: 'heartbeat_sent' }));
+  } catch (e) {
+    console.error(JSON.stringify({ action: 'heartbeat_error', error: e.message }));
   }
 }
 
@@ -301,5 +403,13 @@ exports.handler = async () => {
 
   const triggered = results.filter(r => r.triggered).map(r => r.symbol);
   console.log(JSON.stringify({ action: 'done', triggered, results }));
+
+  // Heartbeat: si no hubo señales y pasaron 2h desde el último status → avisa
+  if (triggered.length === 0 && await shouldSendHeartbeat()) {
+    const msg = buildHeartbeatMessage(results);
+    await sendHeartbeat(msg);
+    await markHeartbeatSent();
+  }
+
   return { triggered };
 };

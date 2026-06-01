@@ -367,6 +367,38 @@ function detectHook(K, D, type) {
 }
 
 /**
+ * Detecta cruce de K sobre D en la dirección esperada, SIN requerir zona extrema.
+ * Estrategia B: trend-following con crossover en cualquier nivel del stoch.
+ *
+ * @param {Array<number|null>} K
+ * @param {Array<number|null>} D
+ * @param {'crash'|'boom'} type
+ * @returns {0|1}
+ */
+function detectCrossoverAny(K, D, type) {
+  const isCrash = type === 'crash';
+  let curr = -1, prev = -1;
+  for (let i = K.length - 1; i >= 0; i--) {
+    if (K[i] !== null && D[i] !== null) {
+      if (curr === -1) curr = i;
+      else if (prev === -1) { prev = i; break; }
+    }
+  }
+  if (curr === -1 || prev === -1) return 0;
+
+  const kCurr = K[curr], dCurr = D[curr];
+  const kPrev = K[prev], dPrev = D[prev];
+
+  if (isCrash) {
+    // K estaba sobre D, ahora K cruzó bajo D — en cualquier nivel
+    return (kPrev > dPrev && kCurr < dCurr) ? 1 : 0;
+  } else {
+    // K estaba bajo D, ahora K cruzó sobre D — en cualquier nivel
+    return (kPrev < dPrev && kCurr > dCurr) ? 1 : 0;
+  }
+}
+
+/**
  * Extrae los 24 features multi-timeframe requeridos por el modelo ML v2.
  * Temporalidades: 1H (trend + stoch), 15M (stoch), 5M (stoch + momentum).
  *
@@ -488,6 +520,7 @@ module.exports = {
   extractStochFeatures,
   extractStochFeaturesMTF,
   detectHook,
+  detectCrossoverAny,
   calcSlope,
   findSwingPoints,
   calcReactionZone,

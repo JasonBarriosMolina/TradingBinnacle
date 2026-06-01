@@ -29,7 +29,7 @@ const ADMIN_UID     = process.env.ADMIN_USER_ID       || 'SYSTEM';
 // ── 1. Anti-duplicado ─────────────────────────────────────────────────────────
 
 async function isDuplicate(symbol) {
-  const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
+  const cutoff = new Date(Date.now() - 20 * 60 * 1000).toISOString();
   const resp = await dynamo.send(new QueryCommand({
     TableName:                TABLE_SIGNALS,
     KeyConditionExpression:   'userId = :uid AND timestampSignalId >= :cut',
@@ -216,6 +216,10 @@ function buildTelegramMessage(signal, mlResult) {
   msg += `🛡 <b>Stop Loss:</b>   <code>${sl}</code>  (${signal.sl_puntos} pts)\n`;
   msg += `🎯 <b>Take Profit:</b> <code>${tp}</code>  (${signal.tp_puntos} pts)\n`;
   msg += `\n`;
+  const stratLine = signal.strategy === 'zona_extrema'
+    ? '📊 Zona extrema (1H+15M &gt;80/&lt;20 + hook)'
+    : '📈 Tendencia confirmada (K&lt;D crash / K&gt;D boom)';
+  msg += `⚡ <b>Estrategia:</b>    ${stratLine}\n`;
   msg += `📊 <b>Tendencia 1H:</b>  ${trendLine}\n`;
   msg += `🔗 <b>TF alineadas:</b>  ${signal.tf_alignment ?? '?'}/3\n`;
   msg += `🏛 <b>Zona:</b>          ${zoneLine}\n`;
